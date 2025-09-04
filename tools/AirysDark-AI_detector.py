@@ -276,13 +276,13 @@ def write_workflow(ptype: str):
             if: steps.diff.outputs.changed == 'true'
             uses: peter-evans/create-pull-request@v6
             with:
-              token: ${{{{ secrets.BOT_TOKEN }}}}   # PAT with repo + workflow scopes
+              token: ${{{{ secrets.BOT_TOKEN }}}}
               branch: ai/airysdark-ai-autofix
               commit-message: "chore: AirysDark-AI auto-fix"
               title: "AirysDark-AI: automated build fix"
               body: |
                 This PR was opened automatically by a generated workflow after a failed build.
-                - Probed command: ${{{{ steps.probe.outputs.BUILD_CMD }}}}}
+                - Probed command: ${{{{ steps.probe.outputs.BUILD_CMD }}}}
                 - Captured the failing build log
                 - Proposed a minimal fix via AI
                 - Committed the changes for review
