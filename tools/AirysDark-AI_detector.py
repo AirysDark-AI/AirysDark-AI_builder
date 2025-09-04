@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-# AirysDark-AI_detector.py (updated: recursive detection for all project types)
+# AirysDark-AI_detector.py
+# - Recursive detection for all project types (whole repo)
+# - Generates one workflow per detected type:
+#     .github/workflows/AirysDark-AI_<type>.yml
+# - Linux type supports Makefile and Meson/Ninja automatically
 
 import os
 import pathlib
@@ -47,13 +51,20 @@ def detect_types():
     # go
     if exists_any(["**/go.mod"]):
         types.append("go")
-    # linux / makefile
-    if exists_any(["**/Makefile"]):
+    # linux: treat Makefiles, meson.build, *.mk, or a linux/ dir as a linux build
+    if exists_any(["**/Makefile", "**/*.mk", "**/meson.build", "linux", "linux/**"]):
         types.append("linux")
 
     if not types:
         types.append("unknown")
-    return types
+
+    # de-dupe while preserving order
+    seen, deduped = set(), []
+    for t in types:
+        if t not in seen:
+            seen.add(t)
+            deduped.append(t)
+    return deduped
 
 # ---------- Build commands ----------
 BUILD_CMDS = {
@@ -66,7 +77,28 @@ BUILD_CMDS = {
     "maven":   "mvn -B package --file pom.xml",
     "flutter": "flutter build apk --debug",
     "go":      "go build ./...",
-    "linux":   "make -j",
+    # Linux: Makefile (root or first found) → make; else Meson/Ninja (root or first found)
+    "linux": (
+        "bash -lc '"
+        "if [ -f Makefile ]; then "
+        "  make -j; "
+        "else "
+        "  set -e; "
+        "  d=$(git ls-files | grep -E \"(^|/)Makefile$\" | head -n1 | xargs -I{} dirname {}); "
+        "  if [ -n \"$d\" ]; then "
+        "    make -C \"$d\" -j; "
+        "  elif [ -f meson.build ]; then "
+        "    (meson setup build --wipe || true); meson setup build || true; ninja -C build; "
+        "  else "
+        "    d=$(git ls-files | grep -E \"(^|/)meson.build$\" | head -n1 | xargs -I{} dirname {}); "
+        "    if [ -n \"$d\" ]; then "
+        "      (cd \"$d\" && (meson setup build --wipe || true); meson setup build || true; ninja -C build); "
+        "    else "
+        "      echo \"No Makefile or meson.build found; cannot run linux build\"; exit 1; "
+        "    fi; "
+        "  fi; "
+        "fi'"
+    ),
     "unknown": "echo 'No build system detected' && exit 1",
 }
 
@@ -118,7 +150,15 @@ def setup_steps(ptype: str) -> str:
             with: { go-version: "1.22" }
           - run: go version
         """)
-    # cmake/python/linux/unknown don't need extra setup beyond setup-python
+    if ptype == "linux":
+        # ensure meson/ninja are available when meson.build is present
+        return textwrap.dedent("""
+          - name: Install Meson & Ninja (Linux only)
+            run: |
+              sudo apt-get update
+              sudo apt-get install -y meson ninja-build pkg-config
+        """)
+    # cmake/python/unknown don't need extra setup beyond setup-python
     return ""
 
 # ---------- Workflow writer ----------
@@ -170,6 +210,7 @@ def write_workflow(ptype: str, cmd: str):
               exit 0
             continue-on-error: true
 
+          # --- AI auto-fix block (OpenAI → llama fallback) ---
           - name: Build llama.cpp (CMake, no CURL)
             run: |
               git clone --depth=1 https://github.com/ggml-org/llama.cpp
@@ -196,13 +237,14 @@ def write_workflow(ptype: str, cmd: str):
               BUILD_CMD: ${{{{ steps.build.outputs.BUILD_CMD }}}}
             run: python3 tools/AirysDark-AI_builder.py || true
 
+          # --- Only open PR if changes exist (use PAT with workflow scope) ---
           - name: Check for changes
             id: diff
             run: |
               git add -A
               if git diff --cached --quiet; then
                 echo "changed=false" >> "$GITHUB_OUTPUT"
-              else
+              else:
                 echo "changed=true" >> "$GITHUB_OUTPUT"
               fi
 
@@ -210,7 +252,7 @@ def write_workflow(ptype: str, cmd: str):
             if: steps.diff.outputs.changed == 'true'
             uses: peter-evans/create-pull-request@v6
             with:
-              token: ${{{{ secrets.BOT_TOKEN }}}}
+              token: ${{{{ secrets.BOT_TOKEN }}}}   # PAT with repo + workflow scopes
               branch: ai/airysdark-ai-autofix
               commit-message: "chore: AirysDark-AI auto-fix"
               title: "AirysDark-AI: automated build fix"
