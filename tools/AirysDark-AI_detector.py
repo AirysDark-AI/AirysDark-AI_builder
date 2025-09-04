@@ -230,18 +230,19 @@ def setup_steps_inline(ptype: str) -> str:
     return ""
 
 # ---------- PROBE workflow generator (brace-safe) ----------
-def write_probe_workflow_for_type(ptype: str):
-    setup_inline = setup_steps_inline(ptype)
 
-    # Brace-safe template: use placeholders for ${{ }} and replace at the end
+def write_probe_workflow_for_android():
+    setup_inline = setup_steps_inline("android")
+
     tmpl = r"""
-name: AirysDark-AI — Probe __PTYPE_CAP__
+name: AirysDark-AI — Probe Android
 
 on:
   workflow_dispatch:
   push:
     branches:
       - "**"
+  pull_request:
 
 permissions:
   contents: write
@@ -268,25 +269,27 @@ jobs:
           curl -fL "$BASE_URL/AirysDark-AI_probe.py"     -o tools/AirysDark-AI_probe.py
           curl -fL "$BASE_URL/AirysDark-AI_builder.py"  -o tools/AirysDark-AI_builder.py
           ls -la tools
+
 __SETUP_INLINE__
-      - name: Probe build command
+
+      - name: Probe build command (Android)
         id: probe
         shell: bash
         run: |
           set -euxo pipefail
-          python3 tools/AirysDark-AI_probe.py --type "__PTYPE__" | tee /tmp/probe.out
+          python3 tools/AirysDark-AI_probe.py --type "android" | tee /tmp/probe.out
           CMD=$(grep -E '^BUILD_CMD=' /tmp/probe.out | sed 's/^BUILD_CMD=//')
           echo "BUILD_CMD=$CMD" >> "$GITHUB_OUTPUT"
 
-      - name: Generate final workflow .github/workflows/AirysDark-AI___PTYPE__.yml
+      - name: Generate final workflow .github/workflows/AirysDark-AI_android.yml
         shell: bash
         env:
           BUILD_CMD: "__GHA__ steps.probe.outputs.BUILD_CMD __GHA_END__"
         run: |
           set -euo pipefail
           mkdir -p .github/workflows
-          cat > .github/workflows/AirysDark-AI___PTYPE__.yml <<'YAML'
-          name: AirysDark-AI — __PTYPE_CAP__ (generated)
+          cat > .github/workflows/AirysDark-AI_android.yml <<'YAML'
+          name: AirysDark-AI — Android (generated)
 
           on:
             workflow_dispatch:
@@ -308,7 +311,16 @@ __SETUP_INLINE__
                 - uses: actions/setup-python@v5
                   with: { python-version: "3.11" }
                 - run: pip install requests
-__SETUP_INLINE__
+
+                # Android SDK / Java
+                - uses: actions/setup-java@v4
+                  with:
+                    distribution: temurin
+                    java-version: "17"
+                - uses: android-actions/setup-android@v3
+                - run: yes | sdkmanager --licenses
+                - run: sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+
                 - name: Ensure AirysDark-AI tools (detector, builder)
                   shell: bash
                   run: |
@@ -335,7 +347,7 @@ __SETUP_INLINE__
                   if: always()
                   uses: actions/upload-artifact@v4
                   with:
-                    name: __PTYPE__-build-log
+                    name: android-build-log
                     path: build.log
                     if-no-files-found: warn
                     retention-days: 7
@@ -377,10 +389,21 @@ __SETUP_INLINE__
                   if: always()
                   uses: actions/upload-artifact@v4
                   with:
-                    name: __PTYPE__-ai-patch
+                    name: android-ai-patch
                     path: .pre_ai_fix.patch
                     if-no-files-found: ignore
                     retention-days: 7
+
+                - name: Upload Android artifacts
+                  if: always()
+                  uses: actions/upload-artifact@v4
+                  with:
+                    name: android-artifacts
+                    if-no-files-found: ignore
+                    retention-days: 7
+                    path: |
+                      **/build/outputs/**/*.apk
+                      **/build/outputs/**/*.aab
 
                 - name: Check for changes
                   id: diff
@@ -397,9 +420,9 @@ __SETUP_INLINE__
                   uses: peter-evans/create-pull-request@v6
                   with:
                     token: __GHA__ secrets.BOT_TOKEN __GHA_END__
-                    branch: ai/airysdark-ai-autofix-__PTYPE__
-                    commit-message: "chore: AirysDark-AI auto-fix (__PTYPE__)"
-                    title: "AirysDark-AI: automated build fix (__PTYPE__)"
+                    branch: ai/airysdark-ai-autofix-android
+                    commit-message: "chore: AirysDark-AI auto-fix (android)"
+                    title: "AirysDark-AI: automated build fix (android)"
                     body: |
                       This PR was opened automatically by a generated workflow after a failed build.
                       - Build command: __GHA__ steps.build.outputs.BUILD_CMD __GHA_END__
@@ -413,13 +436,13 @@ __SETUP_INLINE__
         uses: peter-evans/create-pull-request@v6
         with:
           token: __GHA__ secrets.BOT_TOKEN __GHA_END__
-          branch: ai/airysdark-ai-workflow-__PTYPE__
-          commit-message: "chore: add AirysDark-AI___PTYPE__ workflow (probed)"
-          title: "AirysDark-AI: add __PTYPE__ workflow (from probe)"
+          branch: ai/airysdark-ai-workflow-android
+          commit-message: "chore: add AirysDark-AI_android workflow (probed)"
+          title: "AirysDark-AI: add Android workflow (from probe)"
           body: |
-            This PR adds the final __PTYPE__ AI build workflow, generated by the probe run.
+            This PR adds the final Android AI build workflow, generated by the probe run.
             - Probed command: __GHA__ steps.probe.outputs.BUILD_CMD __GHA_END__
-            - Next: merge this PR, then run “AirysDark-AI — __PTYPE_CAP__ (generated)”
+            - Next: merge this PR, then run “AirysDark-AI — Android (generated)”
           labels: automation, ci
 """.lstrip("\n")
 
@@ -428,20 +451,21 @@ __SETUP_INLINE__
         setup_block = textwrap.indent(setup_inline.rstrip() + "\n", " " * 6)
 
     yaml = (tmpl
-            .replace("__SETUP_INLINE__", setup_block.rstrip("\n"))
-            .replace("__PTYPE__", ptype)
-            .replace("__PTYPE_CAP__", ptype.capitalize())
-            .replace("__GHA__", "${{")
-            .replace("__GHA_END__", "}}"))
+        .replace("__SETUP_INLINE__", setup_block.rstrip("\n"))
+        .replace("__GHA__", "${{")
+        .replace("__GHA_END__", "}}"))
 
-    (WF / f"AirysDark-AI_prob_{ptype}.yml").write_text(yaml)
-    print(f"✅ Generated: AirysDark-AI_prob_{ptype}.yml")
+    (WF / "AirysDark-AI_prob_android.yml").write_text(yaml)
+    print("✅ Generated: AirysDark-AI_prob_android.yml")
 
 # ---------- Main ----------
 def main():
     types = detect_types()
     for t in types:
-        write_probe_workflow_for_type(t)
+        if t == "android":
+            write_probe_workflow_for_android()
+        else:
+            write_probe_workflow_for_type(t)
     print(f"Done. Generated {len(types)} PROBE workflow(s) in {WF}")
 
 if __name__ == "__main__":
