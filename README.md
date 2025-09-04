@@ -30,6 +30,7 @@ Add in **Settings → Secrets and variables → Actions**:
 Create: **`.github/workflows/AirysDark-AI_detector.yml`**
 
 ```yaml
+# .github/workflows/AirysDark-AI_detector.yml
 name: AirysDark-AI_detector
 
 on:
@@ -44,17 +45,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+        with: { fetch-depth: 0 }
 
       - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+        with: { python-version: "3.11" }
 
       - name: Install deps
         run: pip install requests pyyaml
 
-      # Always ensure tools/ has the detector + builder scripts (from AirysDark-AI org)
       - name: Ensure AirysDark-AI tools
         shell: bash
         run: |
@@ -63,8 +61,6 @@ jobs:
           BASE_URL="https://raw.githubusercontent.com/AirysDark-AI/AirysDark-AI_builder/main/tools"
           [ -f tools/AirysDark-AI_detector.py ] || curl -fL "$BASE_URL/AirysDark-AI_detector.py" -o tools/AirysDark-AI_detector.py
           [ -f tools/AirysDark-AI_builder.py ]  || curl -fL "$BASE_URL/AirysDark-AI_builder.py"  -o tools/AirysDark-AI_builder.py
-          ls -la tools
-          python3 --version
 
       - name: Generate workflows + autobuilder script
         run: python3 ./tools/AirysDark-AI_detector.py
@@ -72,6 +68,7 @@ jobs:
       - name: Create PR with generated workflows
         uses: peter-evans/create-pull-request@v6
         with:
+          token: ${{ secrets.BOT_TOKEN }}   # <-- use PAT with workflow scope
           branch: ai/airysdark-ai-bootstrap
           title: "AirysDark-AI: bootstrap (multi-purpose)"
           commit-message: "chore: generate AirysDark-AI workflows + script (multi-purpose)"
@@ -126,7 +123,7 @@ jobs:
         with: { python-version: "3.11" }
       - run: pip install requests
 
-      # Ensure tools/ has the AI scripts (from AirysDark-AI org)
+      # Ensure tools/ has the AI scripts (fetched from your builder repo if missing)
       - name: Ensure AirysDark-AI tools
         shell: bash
         run: |
@@ -193,6 +190,32 @@ jobs:
           AI_BUILDER_ATTEMPTS: "3"
           BUILD_CMD: ${{ steps.buildcmd.outputs.BUILD_CMD }}
         run: python3 tools/AirysDark-AI_builder.py || true
+
+      # Create a PR only if the AI step created changes (uses PAT with workflow scope)
+      - name: Check for changes
+        id: diff
+        run: |
+          git add -A
+          if git diff --cached --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create PR with AI fixes
+        if: steps.diff.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.BOT_TOKEN }}   # <-- PAT with repo + workflow scopes
+          branch: ai/airysdark-ai-autofix
+          commit-message: "chore: AirysDark-AI auto-fix"
+          title: "AirysDark-AI: automated build fix"
+          body: |
+            This PR was opened automatically by **AirysDark-AI_universal** after a failed build.
+            - Captured the failing build log
+            - Proposed a minimal fix via AI
+            - Committed the changes for review
+          labels: automation, ci
 ```
 
 ---
