@@ -233,7 +233,7 @@ def setup_steps_inline(ptype: str) -> str:
 def write_probe_workflow_for_type(ptype: str):
     setup_inline = setup_steps_inline(ptype)
 
-    # Build the YAML using placeholders; then replace them so ${{ }} is literal.
+    # Brace-safe template: use placeholders for ${{ }} and replace at the end
     tmpl = r"""
 name: AirysDark-AI — Probe __PTYPE_CAP__
 
@@ -289,10 +289,11 @@ __SETUP_INLINE__
           name: AirysDark-AI — __PTYPE_CAP__ (generated)
 
           on:
-  workflow_dispatch:
-  push:
-    branches:
-      - "**"
+            workflow_dispatch:
+            push:
+              branches:
+                - "**"
+            pull_request:
 
           jobs:
             build:
