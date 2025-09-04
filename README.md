@@ -5,37 +5,29 @@ It auto-detects your project type, runs builds, and if the build fails, an AI pr
 
 ---
 
-## 📂 Repo structure (starter)
-```
-AirysDark-AI_Builder/
-├── tools/
-│   ├── AirysDark-AI_builder.py        # AI auto-fix script (stub in this starter; replace with your real script)
-│   └── AirysDark-AI_detector.py       # Detector + workflow generator (stub in this starter; replace with your real script)
-├── .github/
-│   └── workflows/
-│       ├── AirysDark-AI_detector.yml  # Bootstrap generator workflow
-│       └── AirysDark-AI_universal.yml # Universal reusable workflow
-├── examples/
-│   └── caller_workflow.yml            # Example caller workflow for other repos
-└── README.md
-```
-
-> **Note:** The two scripts in `tools/` here are **stubs** so you can push and wire up CI immediately. Replace them with your actual scripts when ready.
+## What’s inside
+- `tools/AirysDark-AI_detector.py` — scans your repo (Gradle/Android, CMake, Node, Python, Rust, Dotnet, Maven, Flutter, Go, or unknown) and generates `.github/workflows/AirysDark-AI_<type>.yml` per detection.  
+- `tools/AirysDark-AI_builder.py` — attempts automatic fixes (OpenAI first if `OPENAI_API_KEY` is set; fallback to llama.cpp + TinyLlama).  
+- `.github/workflows/AirysDark-AI_detector.yml` — **bootstrap** workflow to generate per-type workflows.  
+- `.github/workflows/AirysDark-AI_universal.yml` — **reusable** workflow that other repos can call.  
+- `examples/caller_workflow.yml` — example “caller” workflow for other repos.
 
 ---
 
-## 🔑 Required GitHub Secrets (repo → Settings → Secrets and variables → Actions)
-- `BOT_TOKEN` → a GitHub Personal Access Token (PAT) with:
+## 🔑 Required GitHub Secrets
+Add in **Settings → Secrets and variables → Actions**:
+
+- `BOT_TOKEN` — GitHub Personal Access Token (PAT) with:
   - `contents: write`
   - `pull_requests: write`
-- *(optional)* `OPENAI_API_KEY` → to try OpenAI before the llama.cpp fallback (improves quality/speed).
+- *(Optional)* `OPENAI_API_KEY` — use OpenAI (e.g., `gpt-4o-mini`) before the llama.cpp fallback.
 
 ---
 
-## 🚀 Quick Setup
+# Create these workflow files (copy/paste)
 
-### 1) Run the bootstrap workflow (generates per-type workflows via PR)
-Create: **.github/workflows/AirysDark-AI_detector.yml** (already included)
+## 1) Bootstrap generator (creates per-type workflows)
+Create: **`.github/workflows/AirysDark-AI_detector.yml`**
 
 ```yaml
 name: AirysDark-AI_detector
@@ -79,44 +71,14 @@ jobs:
           labels: automation, ci
 ```
 
-Run from **Actions → AirysDark-AI_detector**. It will open a PR with the generated workflows once your real detector is in place.
+### How to run
+- Go to your repo → **Actions** → run **AirysDark-AI_detector**.  
+- It will open a PR with the generated `.github/workflows/AirysDark-AI_<type>.yml` files and the builder script.
 
 ---
 
-### 2) Reusable autobuilder for any project repo
-Create in the *project* repo: **.github/workflows/autobuilder.yml** (example also in `examples/`)
-
-```yaml
-name: Project Autobuilder (AirysDark-AI Reusable)
-
-on:
-  workflow_dispatch:
-  push:
-  pull_request:
-
-jobs:
-  autobuild:
-    uses: AirysDark/AirysDark-AI_Builder/.github/workflows/AirysDark-AI_universal.yml@main
-    secrets: inherit
-    with:
-      project_dir: "."     # "." for repo root, or "android"/"backend"/"app" for subfolder
-      # build_cmd: "npm ci && npm run build --if-present"   # optional override
-```
-
-**Pointing the AI to your repo**  
-- The `uses:` line references the **universal workflow in this repo**.  
-  - Branch: `@main`
-  - Tag: `@v1`
-  - Commit SHA: `@<commit-sha>`
-- The `project_dir` input tells the workflow where in the caller repo the project lives.
-- Set `build_cmd` if you want to override auto-detection.
-
-**Secrets in the *calling* repo:**  
-- `BOT_TOKEN` (+ optional `OPENAI_API_KEY`).
-
----
-
-## 3) Full code: `.github/workflows/AirysDark-AI_universal.yml`
+## 2) Universal reusable workflow (the one other repos “uses:”)
+Create: **`.github/workflows/AirysDark-AI_universal.yml`**
 
 ```yaml
 name: AirysDark-AI — Universal (reusable)
@@ -144,7 +106,6 @@ permissions:
 jobs:
   universal:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
@@ -213,28 +174,54 @@ jobs:
 
 ---
 
-## 4) Stubs you should replace (when ready)
+## 3) Example “caller” workflow in another repo
+Create in the **project that wants to use your builder**:  
+**`.github/workflows/autobuilder.yml`**
 
-**tools/AirysDark-AI_builder.py**
-```python
-#!/usr/bin/env python3
-print("AirysDark-AI_builder.py (stub): replace this with your real AI builder script.")
-exit(0)
+```yaml
+name: Project Autobuilder (AirysDark-AI Reusable)
+
+on:
+  workflow_dispatch:
+  push:
+  pull_request:
+
+jobs:
+  autobuild:
+    # Point to your builder repo + universal workflow:
+    uses: AirysDark/AirysDark-AI_Builder/.github/workflows/AirysDark-AI_universal.yml@main
+    secrets: inherit
+    with:
+      # Where the project lives in THIS repo:
+      project_dir: "."       # root
+      # project_dir: "backend"   # subfolder example
+      # build_cmd: "pip install -e . && pytest"   # optional override
 ```
 
-**tools/AirysDark-AI_detector.py**
-```python
-#!/usr/bin/env python3
-print("AirysDark-AI_detector.py (stub): replace this with your real detector/generator script.")
-exit(0)
-```
+---
 
-> After replacing the stubs with your real scripts, the workflows will build and the AI fix step will run.
+## Pointing the AI to your repo
+- The `uses:` line references your published builder repo.
+  - Branch: `@main`
+  - Tag: `@v1`
+  - Commit SHA: `@<commit-sha>`
+- `project_dir` tells the workflow where the build files live (root or a subfolder).
+- `build_cmd` lets you override auto-detection if you prefer.
+
+---
+
+## Optional: Per-type workflows
+After running the detector, it will generate files like:
+- `.github/workflows/AirysDark-AI_python.yml`
+- `.github/workflows/AirysDark-AI_cmake.yml`
+- `.github/workflows/AirysDark-AI_android.yml`
+
+You can run those directly from Actions too. They already use `tools/AirysDark-AI_builder.py` on failures and open PRs with proposed patches.
 
 ---
 
 ## ✅ Summary
-- Add `BOT_TOKEN` (+ optional `OPENAI_API_KEY`) as secrets.
-- Run **AirysDark-AI_detector** to generate per-type workflows via PR.
-- Use **AirysDark-AI_universal** from other repos with `uses:` + `project_dir`.
-- Replace the two **stub** scripts in `tools/` with your actual implementations.
+- Add `BOT_TOKEN` (+ optional `OPENAI_API_KEY`) as secrets.  
+- Run **AirysDark-AI_detector** → get per-type CI via PR.  
+- Use **AirysDark-AI_universal** from other repos with `uses:` + `project_dir`.  
+- Override with `build_cmd` anytime.
