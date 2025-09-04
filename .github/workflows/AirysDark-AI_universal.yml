@@ -31,13 +31,13 @@ jobs:
         with: { python-version: "3.11" }
       - run: pip install requests
 
-      # Ensure tools/ has the AI builder scripts
+      # Ensure tools/ has the AI scripts (from AirysDark-AI org)
       - name: Ensure AirysDark-AI tools
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p tools
-          BASE_URL="https://raw.githubusercontent.com/AirysDark/AirysDark-AI_Builder/main/tools"
+          BASE_URL="https://raw.githubusercontent.com/AirysDark-AI/AirysDark-AI_builder/main/tools"
           [ -f tools/AirysDark-AI_detector.py ] || curl -fL "$BASE_URL/AirysDark-AI_detector.py" -o tools/AirysDark-AI_detector.py
           [ -f tools/AirysDark-AI_builder.py ]  || curl -fL "$BASE_URL/AirysDark-AI_builder.py"  -o tools/AirysDark-AI_builder.py
           ls -la tools
