@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
 """
 AirysDark-AI_probe.py — deep repo scan to pick the right BUILD_CMD
-Prints exactly: BUILD_CMD=<command>
+Priority:
+  1) Parse README / docs for explicit build commands matching the requested type
+  2) Infer from repo files (heuristics)
+Prints exactly one line: BUILD_CMD=<command>
 """
 
 import os, re, shlex, subprocess, sys
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 from collections import Counter
 
 ROOT = Path(".").resolve()
 
-def run(cmd: str, cwd: Optional[Path] = None, capture: bool = True):
-    if capture:
-        p = subprocess.run(cmd, cwd=cwd, shell=True, text=True,
-                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        return p.stdout, p.returncode
-    else:
-        p = subprocess.run(cmd, cwd=cwd, shell=True)
-        return "", p.returncode
+# ---------- scanning ----------
+TEXT_EXTS = {".md", ".markdown", ".txt", ".rst", ".adoc"}
+DOC_DIR_HINTS = ("docs",)
+MAX_READ_BYTES = 200_000
+MAX_FILES_TO_READ = 400
 
 def scan_all_files() -> List[Tuple[str, Path]]:
     out = []
@@ -34,24 +34,151 @@ def scan_all_files() -> List[Tuple[str, Path]]:
             out.append((f.lower(), rel))
     return out
 
+def safe_read_text(p: Path) -> str:
+    try:
+        raw = (ROOT / p).read_bytes()
+        if len(raw) > MAX_READ_BYTES:
+            raw = raw[:MAX_READ_BYTES]
+        return raw.decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+def collect_text_corpus() -> str:
+    files = scan_all_files()
+    picked: List[Path] = []
+
+    # Priority 1: README*
+    for name, rel in files:
+        if Path(rel.name.lower()).name.startswith("readme"):
+            picked.append(rel)
+
+    # Priority 2: text extensions anywhere
+    for name, rel in files:
+        if len(picked) >= MAX_FILES_TO_READ: break
+        if Path(name).suffix in TEXT_EXTS:
+            picked.append(rel)
+
+    # Priority 3: docs/**
+    for name, rel in files:
+        if len(picked) >= MAX_FILES_TO_READ: break
+        parts = [p.lower() for p in Path(rel).parts]
+        if any(h in parts for h in DOC_DIR_HINTS) and Path(name).suffix in TEXT_EXTS:
+            picked.append(rel)
+
+    # Dedup preserve order
+    seen = set(); ordered: List[Path] = []
+    for p in picked:
+        key = str(p).lower()
+        if key not in seen:
+            seen.add(key); ordered.append(p)
+
+    chunks: List[str] = []
+    for p in ordered[:MAX_FILES_TO_READ]:
+        chunks.append(safe_read_text(p))
+    return "\n\n".join(chunks)
+
+# ---------- helpers ----------
+def run(cmd: str, cwd: Optional[Path] = None, capture: bool = True):
+    if capture:
+        p = subprocess.run(cmd, cwd=cwd, shell=True, text=True,
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        return p.stdout, p.returncode
+    else:
+        p = subprocess.run(cmd, cwd=cwd, shell=True)
+        return "", p.returncode
+
 def prefer_shortest(paths: List[Path]) -> Optional[Path]:
-    if not paths:
-        return None
+    if not paths: return None
     return sorted(paths, key=lambda p: len(Path(str(p)).parts))[0]
 
 def print_output_var(name: str, val: str):
     print(f"{name}={val}")
 
-# -------- Linux (Make/Meson/only .mk) --------
+# ---------- README/doc command extraction ----------
+# Map each type to patterns that should count as *that* type’s build command.
+# We capture the whole command line; if multi-line code blocks contain chained commands with &&, we keep them.
+TYPE_PATTERNS: Dict[str, List[re.Pattern]] = {
+    "android": [
+        re.compile(r"(^|\n|\r)(?:\$?\s*)?(?:\.\/)?gradlew\s+[^\n\r]+", re.I),
+        re.compile(r"(^|\n|\r)(?:\$?\s*)?gradle\s+[^\n\r]+", re.I),
+    ],
+    "cmake": [
+        re.compile(r"(^|\n|\r).*(?:cmake\s+-S\s+\S+|\bcmake\s+\.)\s+-B\s+\S+.*", re.I),
+        re.compile(r"(^|\n|\r).*\bcmake\s+[-\w\/\"\. ]+&&\s*cmake\s+--build[^\n\r]*", re.I),
+    ],
+    "linux": [
+        re.compile(r"(^|\n|\r)(?:\$?\s*)?make(\s+-C\s+\S+)?(\s+-j\S*)?", re.I),
+        re.compile(r"(^|\n|\r).*\bmeson\s+setup[^\n\r]*", re.I),
+        re.compile(r"(^|\n|\r).*\bninja(\s+-C\s+\S+)?[^\n\r]*", re.I),
+    ],
+    "node": [
+        re.compile(r"(^|\n|\r).*\bnpm\s+(?:ci|install)\b[^\n\r]*", re.I),
+        re.compile(r"(^|\n|\r).*\bnpm\s+run\s+build\b[^\n\r]*", re.I),
+        re.compile(r"(^|\n|\r).*\bpnpm\s+(?:install|build)\b[^\n\r]*", re.I),
+        re.compile(r"(^|\n|\r).*\byarn\s+(?:install|build)\b[^\n\r]*", re.I),
+    ],
+    "python": [
+        re.compile(r"(^|\n|\r).*\bpip\s+install\b[^\n\r]*", re.I),
+        re.compile(r"(^|\n|\r).*\bpytest\b[^\n\r]*", re.I),
+        re.compile(r"(^|\n|\r).*\bpython\s+-m\s+pytest\b[^\n\r]*", re.I),
+    ],
+    "rust": [
+        re.compile(r"(^|\n|\r).*\bcargo\s+build\b[^\n\r]*", re.I),
+    ],
+    "dotnet": [
+        re.compile(r"(^|\n|\r).*\bdotnet\s+build\b[^\n\r]*", re.I),
+    ],
+    "maven": [
+        re.compile(r"(^|\n|\r).*\bmvn\b[^\n\r]*", re.I),
+    ],
+    "flutter": [
+        re.compile(r"(^|\n|\r).*\bflutter\s+build\b[^\n\r]*", re.I),
+    ],
+    "go": [
+        re.compile(r"(^|\n|\r).*\bgo\s+build\b[^\n\r]*", re.I),
+    ],
+    "bazel": [
+        re.compile(r"(^|\n|\r).*\bbazel(?:isk)?\s+(?:build|test)\b[^\n\r]*", re.I),
+    ],
+    "scons": [
+        re.compile(r"(^|\n|\r).*\bscons\b[^\n\r]*", re.I),
+    ],
+    "ninja": [
+        re.compile(r"(^|\n|\r).*\bninja(\s+-C\s+\S+)?[^\n\r]*", re.I),
+    ],
+}
+
+def extract_doc_command_for_type(ptype: str, corpus: str) -> Optional[str]:
+    """
+    Return the first plausible command from docs for this type.
+    If multiple match, pick the shortest sensible line, strip prompts, normalize whitespace.
+    """
+    pats = TYPE_PATTERNS.get(ptype, [])
+    candidates: List[str] = []
+    for pat in pats:
+        for m in pat.finditer(corpus):
+            line = m.group(0)
+            # normalize: strip newlines, strip leading $ and spaces
+            line = re.sub(r"^[\n\r\s$>]*", "", line)
+            line = line.strip()
+            # Avoid “mvn (something about build)” false-positives without commands
+            if len(line.split()) >= 2:
+                candidates.append(line)
+    if not candidates:
+        return None
+    # Favor lines that chain the full sequence (e.g. cmake && build) but are not ridiculously long
+    candidates = sorted(candidates, key=lambda s: (len(s), s))
+    return candidates[0]
+
+# ---------- file-based probers (fallbacks) ----------
 def probe_linux(files: List[Tuple[str, Path]]) -> Optional[str]:
-    # Prefer real Makefile/GNUmakefile
     makefiles = [p for (n, p) in files if n in ("makefile", "gnumakefile")]
     mf = prefer_shortest(makefiles)
     if mf:
         if str(mf.parent) == ".":
             return "make -j"
         return f'make -C "{mf.parent}" -j'
-    # Meson
+    # Meson/Ninja
     mesons = [p for (n, p) in files if n == "meson.build"]
     mb = prefer_shortest(mesons)
     if mb:
@@ -65,36 +192,6 @@ def probe_linux(files: List[Tuple[str, Path]]) -> Optional[str]:
         return f'make -C "{likely_dir}" -j'
     return None
 
-# -------- Bazel --------
-def probe_bazel(files: List[Tuple[str, Path]]) -> Optional[str]:
-    workspaces = [p for (n, p) in files if n in ("workspace", "workspace.bazel", "module.bazel")]
-    builds     = [p for (n, p) in files if n in ("build", "build.bazel")]
-    root = prefer_shortest(workspaces) or prefer_shortest(builds)
-    if not root:
-        return None
-    d = root.parent
-    # Prefer bazelisk if available in workflow (we install via action); else bazel
-    return f'cd "{d}" && (command -v bazelisk >/dev/null 2>&1 && bazelisk build //... || bazel build //...)'
-
-# -------- SCons --------
-def probe_scons(files: List[Tuple[str, Path]]) -> Optional[str]:
-    sconstructs = [p for (n, p) in files if n == "sconstruct"]
-    sconss      = [p for (n, p) in files if n == "sconscript"]
-    chosen = prefer_shortest(sconstructs) or prefer_shortest(sconss)
-    if not chosen:
-        return None
-    d = chosen.parent
-    return f'scons -C "{d}" -j'
-
-# -------- Ninja (direct) --------
-def probe_ninja(files: List[Tuple[str, Path]]) -> Optional[str]:
-    ninjas = [p for (n, p) in files if n == "build.ninja"]
-    chosen = prefer_shortest(ninjas)
-    if not chosen:
-        return None
-    return f'ninja -C "{chosen.parent}"'
-
-# -------- Android helpers --------
 def is_app_module(dirp: Path) -> bool:
     for fn in ("build.gradle", "build.gradle.kts"):
         f = dirp / fn
@@ -141,14 +238,12 @@ def run_tasks_list(gradlew: Path) -> str:
 def task_exists(tasks_out: str, name: str) -> bool:
     return re.search(rf"(^|\s){re.escape(name)}(\s|$)", tasks_out) is not None
 
-# -------- Android --------
 def probe_android(files: List[Tuple[str, Path]]) -> Optional[str]:
     gradlews = [p for (n, p) in files if n == "gradlew"]
     if not gradlews and (ROOT / "gradlew").exists():
         gradlews = [Path("gradlew")]
     if not gradlews:
         return "./gradlew assembleDebug --stacktrace"
-
     ranked = []
     for g in gradlews:
         d = (ROOT / g).parent
@@ -178,7 +273,6 @@ def probe_android(files: List[Tuple[str, Path]]) -> Optional[str]:
                 return f"cd {base} && ./gradlew :{guess}:{t} --stacktrace"
     return f"cd {base} && ./gradlew assembleDebug --stacktrace"
 
-# -------- CMake --------
 def probe_cmake(files: List[Tuple[str, Path]]) -> Optional[str]:
     cmakes = [p for (n, p) in files if n == "cmakelists.txt"]
     first = prefer_shortest(cmakes)
@@ -186,7 +280,6 @@ def probe_cmake(files: List[Tuple[str, Path]]) -> Optional[str]:
     outdir = f'build/{str(first.parent).replace("/", "_")}'
     return f'cmake -S "{first.parent}" -B "{outdir}" && cmake --build "{outdir}" -j'
 
-# -------- Node --------
 def probe_node(files: List[Tuple[str, Path]]) -> Optional[str]:
     pkgs = [p for (n, p) in files if n == "package.json"]
     if not pkgs: return None
@@ -198,7 +291,6 @@ def probe_node(files: List[Tuple[str, Path]]) -> Optional[str]:
     chosen = prefer_shortest(with_build) or prefer_shortest(pkgs)
     return f'cd "{chosen.parent}" && npm ci && npm run build --if-present'
 
-# -------- Python --------
 def probe_python(files: List[Tuple[str, Path]]) -> Optional[str]:
     pyprojects = [p for (n, p) in files if n == "pyproject.toml"]
     setups     = [p for (n, p) in files if n == "setup.py"]
@@ -207,14 +299,12 @@ def probe_python(files: List[Tuple[str, Path]]) -> Optional[str]:
     d = chosen.parent
     return f'cd "{d}" && pip install -e . && (pytest || python -m pytest || true)'
 
-# -------- Rust --------
 def probe_rust(files: List[Tuple[str, Path]]) -> Optional[str]:
     cargos = [p for (n, p) in files if n == "cargo.toml"]
     chosen = prefer_shortest(cargos)
     if not chosen: return None
     return f'cd "{chosen.parent}" && cargo build --locked --all-targets --verbose'
 
-# -------- .NET --------
 def probe_dotnet(files: List[Tuple[str, Path]]) -> Optional[str]:
     slns = [p for (n, p) in files if str(p).lower().endswith(".sln")]
     if slns:
@@ -226,38 +316,65 @@ def probe_dotnet(files: List[Tuple[str, Path]]) -> Optional[str]:
         return f'dotnet restore "{chosen}" && dotnet build "{chosen}" -c Release'
     return None
 
-# -------- Maven --------
 def probe_maven(files: List[Tuple[str, Path]]) -> Optional[str]:
     poms = [p for (n, p) in files if n == "pom.xml"]
     chosen = prefer_shortest(poms)
     if not chosen: return None
     return f'mvn -B package --file "{chosen}"'
 
-# -------- Flutter --------
 def probe_flutter(files: List[Tuple[str, Path]]) -> Optional[str]:
     pubs = [p for (n, p) in files if n == "pubspec.yaml"]
     chosen = prefer_shortest(pubs)
     if not chosen: return None
     return f'cd "{chosen.parent}" && flutter build apk --debug'
 
-# -------- Go --------
 def probe_go(files: List[Tuple[str, Path]]) -> Optional[str]:
     mods = [p for (n, p) in files if n == "go.mod"]
     chosen = prefer_shortest(mods)
     if not chosen: return None
     return f'cd "{chosen.parent}" && go build ./...'
 
-# -------- Unknown --------
-def probe_unknown(_files: List[Tuple[str, Path]]) -> str:
-    return "echo 'No build system detected' && exit 1"
+def probe_bazel(files: List[Tuple[str, Path]]) -> Optional[str]:
+    workspaces = [p for (n, p) in files if n in ("workspace", "workspace.bazel", "module.bazel")]
+    builds     = [p for (n, p) in files if n in ("build", "build.bazel")]
+    root = prefer_shortest(workspaces) or prefer_shortest(builds)
+    if not root: return None
+    d = root.parent
+    return f'cd "{d}" && (command -v bazelisk >/dev/null 2>&1 && bazelisk build //... || bazel build //...)'
 
+def probe_scons(files: List[Tuple[str, Path]]) -> Optional[str]:
+    sconstructs = [p for (n, p) in files if n == "sconstruct"]
+    sconss      = [p for (n, p) in files if n == "sconscript"]
+    chosen = prefer_shortest(sconstructs) or prefer_shortest(sconss)
+    if not chosen: return None
+    d = chosen.parent
+    return f'scons -C "{d}" -j'
+
+def probe_ninja(files: List[Tuple[str, Path]]) -> Optional[str]:
+    ninjas = [p for (n, p) in files if n == "build.ninja"]
+    chosen = prefer_shortest(ninjas)
+    if not chosen: return None
+    return f'ninja -C "{chosen.parent}"'
+
+# ---------- main ----------
 def main():
     if len(sys.argv) < 3 or sys.argv[1] != "--type":
         print("Usage: AirysDark-AI_probe.py --type <android|cmake|linux|node|python|rust|dotnet|maven|flutter|go|bazel|scons|ninja|unknown>")
         return 2
     ptype = sys.argv[2].strip().lower()
-    files = scan_all_files()
 
+    # 1) Docs/README parsing — highest priority
+    corpus_raw = collect_text_corpus()
+    corpus = corpus_raw  # keep original case for commands, regex is case-insensitive
+    doc_cmd = extract_doc_command_for_type(ptype, corpus)
+    if doc_cmd:
+        # Normalize some common “cd path && cmd” patterns but otherwise preserve
+        # Executable bit for gradlew will be handled by the workflow build step.
+        print_output_var("BUILD_CMD", doc_cmd)
+        return 0
+
+    # 2) File-based probing — fallback
+    files = scan_all_files()
     dispatch = {
         "android": probe_android,
         "cmake":   probe_cmake,
@@ -272,26 +389,22 @@ def main():
         "bazel":   probe_bazel,
         "scons":   probe_scons,
         "ninja":   probe_ninja,
-        "unknown": probe_unknown,
+        "unknown": lambda _f: "echo 'No build system detected' && exit 1",
     }
 
-    func = dispatch.get(ptype, probe_unknown)
+    func = dispatch.get(ptype, dispatch["unknown"])
     cmd = func(files)
 
     if not cmd:
-        # Friendly fallbacks
-        if ptype == "linux":
-            cmd = "echo 'No Makefile / meson.build found (only .mk includes?)' && exit 1"
-        elif ptype == "cmake":
-            cmd = "echo 'No CMakeLists.txt found' && exit 1"
-        elif ptype == "bazel":
-            cmd = "echo 'No Bazel WORKSPACE / BUILD found' && exit 1"
-        elif ptype == "scons":
-            cmd = "echo 'No SConstruct / SConscript found' && exit 1"
-        elif ptype == "ninja":
-            cmd = "echo 'No build.ninja found' && exit 1"
-        else:
-            cmd = "echo 'No build system detected' && exit 1"
+        # Friendly error lines so the workflow UI is clear
+        friendly = {
+            "linux":   "echo 'No Makefile / meson.build found (only .mk includes?)' && exit 1",
+            "cmake":   "echo 'No CMakeLists.txt found' && exit 1",
+            "bazel":   "echo 'No Bazel WORKSPACE / BUILD found' && exit 1",
+            "scons":   "echo 'No SConstruct / SConscript found' && exit 1",
+            "ninja":   "echo 'No build.ninja found' && exit 1",
+        }
+        cmd = friendly.get(ptype, "echo 'No build system detected' && exit 1")
 
     print_output_var("BUILD_CMD", cmd)
     return 0

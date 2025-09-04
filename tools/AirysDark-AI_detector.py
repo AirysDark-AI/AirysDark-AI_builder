@@ -1,25 +1,47 @@
 #!/usr/bin/env python3
-# AirysDark-AI_detector.py
+# AirysDark-AI_detector.py — deep detector
 #
-# Scans *all files/dirs* in repo to detect build systems.
-# Adds CMake content-aware detection to also flag "linux" when the CMakeLists looks desktop-ish.
-# Writes one PROBE workflow per detected type: .github/workflows/AirysDark-AI_prob_<type>.yml
+# Recursively scans the ENTIRE repo:
+#   • Filename signals (gradlew, CMakeLists.txt, Makefile, *.mk, meson.build, WORKSPACE, etc.)
+#   • Content signals by reading small text files (README, *.md, *.txt, docs/**)
+#   • Reads CMakeLists.txt to decide Android vs Desktop/Linux
+#
+# Then generates one PROBE workflow per detected type:
+#   .github/workflows/AirysDark-AI_prob_<type>.yml
+#
+# Detected types (expanded):
+#   android, cmake, linux, node, python, rust, dotnet, maven, flutter, go,
+#   bazel, scons, ninja, unknown
+#
+# Requires no network except when the generated workflows run and fetch tools.
 
 import os
 import pathlib
-import textwrap
+import re
 import sys
+import textwrap
+from typing import List, Tuple, Set
 
 ROOT = pathlib.Path(os.getenv("PROJECT_DIR", ".")).resolve()
 WF = ROOT / ".github" / "workflows"
 WF.mkdir(parents=True, exist_ok=True)
 
-# ---------- Full-repo scan ----------
-def scan_all_files():
+# ---------------------------
+# Scan utilities
+# ---------------------------
+TEXT_EXTS = {".md", ".markdown", ".txt", ".rst", ".adoc"}
+DOC_DIR_HINTS = ("docs",)
+
+MAX_READ_BYTES = 200_000  # cap per text file
+MAX_FILES_TO_READ = 400   # cap total text files read for speed
+
+def scan_all_files() -> List[Tuple[str, pathlib.Path]]:
     files = []
     for root, dirs, filenames in os.walk(ROOT):
-        if ".git" in dirs:
-            dirs.remove(".git")
+        # skip typical VCS/build caches
+        for skip in [".git", ".github"]:  # we’ll still write there, just don’t read it
+            if skip in dirs:
+                dirs.remove(skip)
         for fn in filenames:
             p = pathlib.Path(root) / fn
             try:
@@ -29,104 +51,214 @@ def scan_all_files():
             files.append((fn.lower(), rel))
     return files
 
-def read_text_safe(p: pathlib.Path) -> str:
+def safe_read_text(p: pathlib.Path) -> str:
     try:
-        return (ROOT / p).read_text(errors="ignore")
+        raw = (ROOT / p).read_bytes()
+        if len(raw) > MAX_READ_BYTES:
+            raw = raw[:MAX_READ_BYTES]
+        return raw.decode("utf-8", errors="ignore")
     except Exception:
         return ""
 
-# ---------- CMake classifier ----------
+def collect_text_corpus(files: List[Tuple[str, pathlib.Path]]) -> str:
+    """
+    Build a lowercase corpus from small text files:
+    - README*, *.md, *.txt anywhere
+    - files in docs/** with texty extensions
+    (capped to avoid huge repos)
+    """
+    picked: List[pathlib.Path] = []
+    # priority 1: README*
+    for name, rel in files:
+        base = pathlib.Path(rel.name.lower())
+        if base.name.startswith("readme"):
+            picked.append(rel)
+
+    # priority 2: text extensions anywhere
+    for name, rel in files:
+        if len(picked) >= MAX_FILES_TO_READ:
+            break
+        if pathlib.Path(name).suffix in TEXT_EXTS:
+            picked.append(rel)
+
+    # priority 3: stuff under docs/**
+    for name, rel in files:
+        if len(picked) >= MAX_FILES_TO_READ:
+            break
+        parts = [p.lower() for p in pathlib.Path(rel).parts]
+        if any(h in parts for h in DOC_DIR_HINTS) and pathlib.Path(name).suffix in TEXT_EXTS:
+            picked.append(rel)
+
+    # Dedup while preserving order
+    seen: Set[str] = set()
+    ordered: List[pathlib.Path] = []
+    for p in picked:
+        key = str(p).lower()
+        if key not in seen:
+            seen.add(key)
+            ordered.append(p)
+
+    chunks: List[str] = []
+    for p in ordered[:MAX_FILES_TO_READ]:
+        chunks.append(safe_read_text(p))
+
+    return "\n\n".join(chunks).lower()
+
+# ---------------------------
+# Heuristics
+# ---------------------------
 ANDROID_HINTS = (
-    "android", "android_abi", "android_platform", "ndk", "cmake_android", "gradle", "externalnativebuild",
-    "find_library(log)", "log-lib", "loglib"
+    "android", "android_abi", "android_platform", "ndk", "cmake_android",
+    "externalnativebuild", "gradle", "find_library(log)", "log-lib", "loglib"
 )
 DESKTOP_HINTS = (
-    "add_executable", "pkgconfig", "find_package(", "threads", "pthread", "x11", "wayland", "gtk", "qt",
-    "set(cmake_system_name linux"
+    "add_executable", "pkgconfig", "find_package(", "threads", "pthread",
+    "x11", "wayland", "gtk", "qt", "set(cmake_system_name linux"
 )
 
-def cmakelists_flavor(cm_txt: str) -> str:
-    t = cm_txt.lower()
-    # Any explicit Android/NDK signal?
+def classify_cmakelists_text(txt: str) -> str:
+    t = txt.lower()
     if any(h in t for h in ANDROID_HINTS):
         return "android"
-    # Strong desktop-ish signals?
     if any(h in t for h in DESKTOP_HINTS):
         return "desktop"
-    # Default bias: treat as desktop unless clearly Android
+    # default to desktop if not clearly android
     return "desktop"
 
-def detect_types():
+BUILD_CMD_PATTERNS = [
+    r"\bcmake\s+(-S\s+\S+|\.)\s+-B\s+\S+",
+    r"\bmake(\s+-C\s+\S+)?\b",
+    r"\bmeson\s+setup\b",
+    r"\bninja(\s+-C\s+\S+)?\b",
+    r"\bgradlew?\s+[\w:\-]+",
+    r"\bnpm\s+(ci|install)\b|\bnpm\s+run\s+build\b",
+    r"\bpip\s+install\b|\bpytest\b|\bpython\s+-m\s+pytest\b",
+    r"\bcargo\s+build\b",
+    r"\bdotnet\s+build\b",
+    r"\bmvn\b|\bmaven\b",
+    r"\bflutter\s+build\b",
+    r"\bgo\s+build\b",
+    r"\bbazel(isk)?\s+(build|test)\b",
+    r"\bscons\b",
+]
+
+def text_hints_detect_types(corpus: str) -> Set[str]:
+    found: Set[str] = set()
+    # Coarse keyword presence
+    keymap = [
+        ("android", ["gradle", "gradlew", "android", "externalnativebuild", "aab", "apk"]),
+        ("cmake",   ["cmake"]),
+        ("linux",   ["make", "meson", "ninja", ".mk"]),
+        ("node",    ["npm", "yarn", "pnpm", "package.json"]),
+        ("python",  ["pip install", "pytest", "pyproject.toml", "setup.py"]),
+        ("rust",    ["cargo build", "cargo test", "cargo"]),
+        ("dotnet",  ["dotnet build", ".sln", ".csproj", "nuget"]),
+        ("maven",   ["mvn ", "maven"]),
+        ("flutter", ["flutter build", "dart", "pubspec.yaml"]),
+        ("go",      ["go build", "go.mod"]),
+        ("bazel",   ["bazel build", "bazel test", "WORKSPACE", "BUILD"]),
+        ("scons",   ["scons"]),
+        ("ninja",   ["build.ninja", "ninja -C"]),
+    ]
+    for t, keys in keymap:
+        if any(k in corpus for k in keys):
+            found.add(t)
+
+    # Regex for explicit commands in docs/readmes
+    for pat in BUILD_CMD_PATTERNS:
+        if re.search(pat, corpus):
+            # map patterns → types (roughly)
+            if "cmake" in pat: found.add("cmake")
+            if "make" in pat or "meson" in pat or "ninja" in pat: found.add("linux")
+            if "gradle" in pat or "gradlew" in pat: found.add("android")
+            if "npm" in pat: found.add("node")
+            if "pip" in pat or "pytest" in pat: found.add("python")
+            if "cargo" in pat: found.add("rust")
+            if "dotnet" in pat: found.add("dotnet")
+            if "mvn" in pat or "maven" in pat: found.add("maven")
+            if "flutter" in pat: found.add("flutter")
+            if "go build" in pat: found.add("go")
+            if "bazel" in pat: found.add("bazel")
+            if "scons" in pat: found.add("scons")
+    return found
+
+# ---------------------------
+# Detection combining filenames + content
+# ---------------------------
+def detect_types() -> List[str]:
     files = scan_all_files()
     fnames = [n for n, _ in files]
     rels   = [str(p).lower() for _, p in files]
 
-    types = []
+    detected: List[str] = []
 
+    # --- Filename-based ---
     # Android / Gradle
     if ("gradlew" in fnames) or any("build.gradle" in n or "settings.gradle" in n for n in fnames):
-        types.append("android")
-
-    # CMake (content-aware -> may also flag linux)
+        detected.append("android")
+    # CMake (content-aware below)
     cmake_paths = [p for (n, p) in files if n == "cmakelists.txt"]
     if cmake_paths:
-        types.append("cmake")
-        # Inspect each CMakeLists; if any looks desktop, also add linux
-        for p in cmake_paths:
-            txt = read_text_safe(p)
-            flavor = cmakelists_flavor(txt)
-            if flavor == "desktop" and "linux" not in types:
-                types.append("linux")
-
-    # Linux umbrella (Make / Meson / any *.mk) — kept as before
+        detected.append("cmake")
+    # Linux umbrella
     if "makefile" in fnames or "gnumakefile" in fnames or "meson.build" in fnames or any(r.endswith(".mk") for r in rels):
-        if "linux" not in types:
-            types.append("linux")
-
+        detected.append("linux")
     # Node
-    if "package.json" in fnames:
-        types.append("node")
+    if "package.json" in fnames: detected.append("node")
     # Python
-    if "pyproject.toml" in fnames or "setup.py" in fnames:
-        types.append("python")
+    if "pyproject.toml" in fnames or "setup.py" in fnames: detected.append("python")
     # Rust
-    if "cargo.toml" in fnames:
-        types.append("rust")
+    if "cargo.toml" in fnames: detected.append("rust")
     # .NET
     if any(r.endswith(".sln") or r.endswith(".csproj") or r.endswith(".fsproj") for r in rels):
-        types.append("dotnet")
+        detected.append("dotnet")
     # Maven
-    if "pom.xml" in fnames:
-        types.append("maven")
+    if "pom.xml" in fnames: detected.append("maven")
     # Flutter
-    if "pubspec.yaml" in fnames:
-        types.append("flutter")
+    if "pubspec.yaml" in fnames: detected.append("flutter")
     # Go
-    if "go.mod" in fnames:
-        types.append("go")
+    if "go.mod" in fnames: detected.append("go")
     # Bazel
     if any(n in ("workspace", "workspace.bazel", "module.bazel") for n in fnames) or \
        any(os.path.basename(r) in ("build", "build.bazel") for r in rels):
-        types.append("bazel")
+        detected.append("bazel")
     # SCons
     if "sconstruct" in fnames or "sconscript" in fnames:
-        types.append("scons")
-    # Ninja (direct)
+        detected.append("scons")
+    # Ninja
     if "build.ninja" in fnames:
-        types.append("ninja")
+        detected.append("ninja")
 
-    if not types:
-        types.append("unknown")
+    # --- Content-based (README / *.md / *.txt / docs/*) ---
+    corpus = collect_text_corpus(files)
+    content_types = text_hints_detect_types(corpus)
+    for t in content_types:
+        if t not in detected:
+            detected.append(t)
 
-    # de-dupe preserve order
+    # --- CMake content-aware classification (add linux if desktop-ish) ---
+    if cmake_paths:
+        for p in cmake_paths:
+            txt = safe_read_text(p)
+            flavor = classify_cmakelists_text(txt)
+            if flavor == "desktop" and "linux" not in detected:
+                detected.append("linux")
+
+    # Fallback
+    if not detected:
+        detected.append("unknown")
+
+    # De-dupe preserving order
     seen, out = set(), []
-    for t in types:
+    for t in detected:
         if t not in seen:
             seen.add(t)
             out.append(t)
     return out
 
-# ---------- Type-specific setup (embedded into final workflow) ----------
+# ---------------------------
+# Type-specific setup (in final generated workflows)
+# ---------------------------
 def setup_steps_inline(ptype: str) -> str:
     if ptype == "android":
         return textwrap.dedent("""
@@ -202,7 +334,9 @@ def setup_steps_inline(ptype: str) -> str:
     # cmake/python/unknown: setup-python only
     return ""
 
-# ---------- PROBE workflow generator (unchanged from your latest) ----------
+# ---------------------------
+# Emit PROBE workflows
+# ---------------------------
 def write_probe_workflow_for_type(ptype: str):
     setup_inline = setup_steps_inline(ptype)
 
@@ -406,20 +540,22 @@ def write_probe_workflow_for_type(ptype: str):
           - name: Create PR with generated final workflow
             uses: peter-evans/create-pull-request@v6
             with:
-              token: ${{ secrets.BOT_TOKEN }}
+              token: ${{{{ secrets.BOT_TOKEN }}}}
               branch: ai/airysdark-ai-workflow-{ptype}
               commit-message: "chore: add AirysDark-AI_{ptype} workflow (probed)"
               title: "AirysDark-AI: add {ptype} workflow (from probe)"
               body: |
                 This PR adds the final {ptype} AI build workflow, generated by the probe run.
-                - Probed command: ${{ steps.probe.outputs.BUILD_CMD }}
+                - Probed command: ${{{{ steps.probe.outputs.BUILD_CMD }}}}
                 - Next: merge this PR, then run **AirysDark-AI — {ptype.capitalize()} (generated)**
               labels: automation, ci
     """
     (WF / f"AirysDark-AI_prob_{ptype}.yml").write_text(textwrap.dedent(yaml))
     print(f"✅ Generated: AirysDark-AI_prob_{ptype}.yml")
 
-# ---------- Main ----------
+# ---------------------------
+# Main
+# ---------------------------
 def main():
     types = detect_types()
     for t in types:
