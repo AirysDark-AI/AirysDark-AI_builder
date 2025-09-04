@@ -22,18 +22,22 @@ MAX_FILES_TO_READ = 400
 def scan_all_files() -> List[Tuple[str, Path]]:
     out = []
     for root, dirs, files in os.walk(ROOT):
-        if ".git" in dirs: dirs.remove(".git")
+        if ".git" in dirs:
+            dirs.remove(".git")
         for f in files:
             p = Path(root) / f
-            try: rel = p.relative_to(ROOT)
-            except Exception: rel = p
+            try:
+                rel = p.relative_to(ROOT)
+            except Exception:
+                rel = p
             out.append((f.lower(), rel))
     return out
 
 def safe_read_text(p: Path) -> str:
     try:
         raw = (ROOT / p).read_bytes()
-        if len(raw) > MAX_READ_BYTES: raw = raw[:MAX_READ_BYTES]
+        if len(raw) > MAX_READ_BYTES:
+            raw = raw[:MAX_READ_BYTES]
         return raw.decode("utf-8", errors="ignore")
     except Exception:
         return ""
@@ -41,24 +45,31 @@ def safe_read_text(p: Path) -> str:
 def collect_text_corpus() -> str:
     files = scan_all_files()
     picked: List[Path] = []
+
     for name, rel in files:
         if Path(rel.name.lower()).name.startswith("readme"):
             picked.append(rel)
+
     for name, rel in files:
-        if len(picked) >= MAX_FILES_TO_READ: break
+        if len(picked) >= MAX_FILES_TO_READ:
+            break
         if Path(name).suffix in TEXT_EXTS:
             picked.append(rel)
+
     for name, rel in files:
-        if len(picked) >= MAX_FILES_TO_READ: break
+        if len(picked) >= MAX_FILES_TO_READ:
+            break
         parts = [p.lower() for p in Path(rel).parts]
         if any(h in parts for h in DOC_DIR_HINTS) and Path(name).suffix in TEXT_EXTS:
             picked.append(rel)
-    seen=set(); ordered=[]
+
+    seen = set(); ordered: List[Path] = []
     for p in picked:
-        k=str(p).lower()
-        if k not in seen:
-            seen.add(k); ordered.append(p)
-    chunks=[]
+        key = str(p).lower()
+        if key not in seen:
+            seen.add(key); ordered.append(p)
+
+    chunks: List[str] = []
     for p in ordered[:MAX_FILES_TO_READ]:
         chunks.append(safe_read_text(p))
     return "\n\n".join(chunks)
@@ -73,7 +84,8 @@ def run(cmd: str, cwd: Optional[Path] = None, capture: bool = True):
         return "", p.returncode
 
 def prefer_shortest(paths: List[Path]) -> Optional[Path]:
-    if not paths: return None
+    if not paths:
+        return None
     return sorted(paths, key=lambda p: len(Path(str(p)).parts))[0]
 
 def print_output_var(name: str, val: str):
@@ -113,7 +125,8 @@ def extract_doc_command_for_type(ptype: str, corpus: str) -> Optional[str]:
             line = re.sub(r"^[\n\r\s$>]*", "", m.group(0)).strip()
             if len(line.split()) >= 2:
                 cands.append(line)
-    if not cands: return None
+    if not cands:
+        return None
     cands = sorted(cands, key=lambda s: (len(s), s))
     return cands[0]
 
@@ -123,29 +136,30 @@ def any_dir_segment(files: List[Tuple[str, Path]], name: str) -> Optional[Path]:
     for _, rel in files:
         parts = [p.lower() for p in Path(rel).parts]
         if seg in parts:
-            return Path(rel).parents[len(parts) - parts[::-1].index(seg) - 1]
+            # return the path to that segment
+            idx = parts.index(seg)
+            return Path(*Path(rel).parts[: idx + 1])
     return None
 
 # ---------- probers ----------
 def probe_linux(files: List[Tuple[str, Path]]) -> Optional[str]:
-    # Prefer Makefile/GNUmakefile
     makefiles = [p for (n, p) in files if n in ("makefile", "gnumakefile")]
     mf = prefer_shortest(makefiles)
     if mf:
-        return ("make -j" if str(mf.parent) == "." else f'make -C "{mf.parent}" -j')
-    # Meson/Ninja
+        return "make -j" if str(mf.parent) == "." else f'make -C "{mf.parent}" -j'
+
     mesons = [p for (n, p) in files if n == "meson.build"]
     mb = prefer_shortest(mesons)
     if mb:
         d = mb.parent
         return f'(cd "{d}" && (meson setup build --wipe || true); meson setup build || true; ninja -C build)'
-    # Only .mk
+
     mk_paths = [p for (n, p) in files if str(p).lower().endswith(".mk")]
     if mk_paths:
         cnt = Counter(str(p.parent) for p in mk_paths)
         likely_dir = Path(sorted(cnt.items(), key=lambda kv: (-kv[1], len(Path(kv[0]).parts)))[0][0])
         return f'make -C "{likely_dir}" -j'
-    # Folder-name bias: linux/
+
     ldir = any_dir_segment(files, "linux")
     if ldir:
         return f'make -C "{ldir}" -j'
@@ -163,22 +177,30 @@ def is_app_module(dirp: Path) -> bool:
     return False
 
 def parse_settings_modules(settings_path: Optional[Path]) -> List[str]:
-    if not settings_path or not settings_path.exists(): return []
-    try: txt = settings_path.read_text(errors="ignore")
-    except Exception: return []
-    mods=[]
+    if not settings_path or not settings_path.exists():
+        return []
+    try:
+        txt = settings_path.read_text(errors="ignore")
+    except Exception:
+        return []
+    mods = []
     for raw in re.findall(r'include\s*\((.*?)\)', txt, flags=re.S):
         for p in re.split(r'[,\s]+', raw.strip()):
-            s=p.strip().strip('"\'')
-            if s.startswith(":"): mods.append(s[1:])
+            s = p.strip().strip('"\'')
+
+            if s.startswith(":"):
+                mods.append(s[1:])
     for raw in re.findall(r'include\s+([^\n]+)', txt):
         for p in raw.split(","):
-            s=p.strip().strip('"\'')
-            if s.startswith(":"): mods.append(s[1:])
-    out, seen=[], set()
+            s = p.strip().strip('"\'')
+
+            if s.startswith(":"):
+                mods.append(s[1:])
+    out, seen = [], set()
     for m in mods:
         if m not in seen:
-            seen.add(m); out.append(m)
+            seen.add(m)
+            out.append(m)
     return out
 
 def run_tasks_list(gradlew: Path) -> str:
@@ -190,34 +212,41 @@ def task_exists(tasks_out: str, name: str) -> bool:
 
 def probe_android(files: List[Tuple[str, Path]]) -> Optional[str]:
     gradlews = [p for (n, p) in files if n == "gradlew"]
-    if not gradlews and (ROOT / "gradlew").exists(): gradlews = [Path("gradlew")]
-    if not gradlews: return "./gradlew assembleDebug --stacktrace"
+    if not gradlews and (ROOT / "gradlew").exists():
+        gradlews = [Path("gradlew")]
+    if not gradlews:
+        return "./gradlew assembleDebug --stacktrace"
 
-    ranked=[]
+    ranked = []
     for g in gradlews:
-        d=(ROOT / g).parent
-        settings=None
-        for sname in ("settings.gradle","settings.gradle.kts"):
-            sp=d / sname
-            if sp.exists(): settings=sp; break
-        modules=parse_settings_modules(settings)
-        has_app=any(is_app_module(d / m.replace(":", "/")) for m in modules)
+        d = (ROOT / g).parent
+        settings = None
+        for sname in ("settings.gradle", "settings.gradle.kts"):
+            sp = d / sname
+            if sp.exists():
+                settings = sp
+                break
+        modules = parse_settings_modules(settings)
+        has_app = any(is_app_module(d / m.replace(":", "/")) for m in modules)
         ranked.append((g, settings is not None, has_app))
     ranked.sort(key=lambda x: (not x[1], not x[2], len(Path(str(x[0])).parts)))
-    g=ranked[0][0]; g_abs=(ROOT / g)
-    try: os.chmod(g_abs, 0o755)
-    except Exception: pass
+    g = ranked[0][0]
+    g_abs = (ROOT / g)
+    try:
+        os.chmod(g_abs, 0o755)
+    except Exception:
+        pass
 
-    tasks_out=run_tasks_list(g_abs)
-    base=shlex.quote(str(g_abs.parent))
-    for t in ["assembleDebug","bundleDebug","assembleRelease","bundleRelease","build"]:
+    tasks_out = run_tasks_list(g_abs)
+    base = shlex.quote(str(g_abs.parent))
+    for t in ["assembleDebug", "bundleDebug", "assembleRelease", "bundleRelease", "build"]:
         if task_exists(tasks_out, t):
             return f"cd {base} && ./gradlew {t} --stacktrace"
-    for guess in ("app","mobile","android"):
-        for t in ["assembleDebug","bundleDebug","assembleRelease","bundleRelease"]:
+    for guess in ("app", "mobile", "android"):
+        for t in ["assembleDebug", "bundleDebug", "assembleRelease", "bundleRelease"]:
             if task_exists(tasks_out, f":{guess}:{t}"):
                 return f"cd {base} && ./gradlew :{guess}:{t} --stacktrace"
-    # Folder-name bias: android/
+
     adir = any_dir_segment(files, "android")
     if adir:
         return f'cd "{adir}" && ./gradlew assembleDebug --stacktrace'
@@ -226,16 +255,20 @@ def probe_android(files: List[Tuple[str, Path]]) -> Optional[str]:
 def probe_cmake(files: List[Tuple[str, Path]]) -> Optional[str]:
     cmakes = [p for (n, p) in files if n == "cmakelists.txt"]
     first = prefer_shortest(cmakes)
-    if not first: return None
+    if not first:
+        return None
     outdir = f'build/{str(first.parent).replace("/", "_")}'
     return f'cmake -S "{first.parent}" -B "{outdir}" && cmake --build "{outdir}" -j'
 
 def probe_node(files: List[Tuple[str, Path]]) -> Optional[str]:
     pkgs = [p for (n, p) in files if n == "package.json"]
-    if not pkgs: return None
+    if not pkgs:
+        return None
     def has_build_script(pkg_path: Path) -> bool:
-        try: txt = (ROOT / pkg_path).read_text(errors="ignore")
-        except Exception: return False
+        try:
+            txt = (ROOT / pkg_path).read_text(errors="ignore")
+        except Exception:
+            return False
         return re.search(r'"scripts"\s*:\s*{[^}]*"build"\s*:', txt, flags=re.S) is not None
     with_build = [p for p in pkgs if has_build_script(p)]
     chosen = prefer_shortest(with_build) or prefer_shortest(pkgs)
@@ -245,14 +278,16 @@ def probe_python(files: List[Tuple[str, Path]]) -> Optional[str]:
     pyprojects = [p for (n, p) in files if n == "pyproject.toml"]
     setups     = [p for (n, p) in files if n == "setup.py"]
     chosen = prefer_shortest(pyprojects) or prefer_shortest(setups)
-    if not chosen: return None
+    if not chosen:
+        return None
     d = chosen.parent
     return f'cd "{d}" && pip install -e . && (pytest || python -m pytest || true)'
 
 def probe_rust(files: List[Tuple[str, Path]]) -> Optional[str]:
     cargos = [p for (n, p) in files if n == "cargo.toml"]
     chosen = prefer_shortest(cargos)
-    if not chosen: return None
+    if not chosen:
+        return None
     return f'cd "{chosen.parent}" && cargo build --locked --all-targets --verbose'
 
 def probe_dotnet(files: List[Tuple[str, Path]]) -> Optional[str]:
@@ -260,11 +295,10 @@ def probe_dotnet(files: List[Tuple[str, Path]]) -> Optional[str]:
     if slns:
         chosen = prefer_shortest(slns)
         return f'dotnet restore "{chosen}" && dotnet build "{chosen}" -c Release'
-    csfs = [p for (n, p) in files if str(p).lower().endswith((".csproj",".fsproj"))]
+    csfs = [p for (n, p) in files if str(p).lower().endswith((".csproj", ".fsproj", ".vcxproj"))]
     chosen = prefer_shortest(csfs)
     if chosen:
         return f'dotnet restore "{chosen}" && dotnet build "{chosen}" -c Release'
-    # Folder-name bias: windows/
     wdir = any_dir_segment(files, "windows")
     if wdir:
         return f'cd "{wdir}" && dotnet build -c Release'
@@ -273,26 +307,30 @@ def probe_dotnet(files: List[Tuple[str, Path]]) -> Optional[str]:
 def probe_maven(files: List[Tuple[str, Path]]) -> Optional[str]:
     poms = [p for (n, p) in files if n == "pom.xml"]
     chosen = prefer_shortest(poms)
-    if not chosen: return None
+    if not chosen:
+        return None
     return f'mvn -B package --file "{chosen}"'
 
 def probe_flutter(files: List[Tuple[str, Path]]) -> Optional[str]:
     pubs = [p for (n, p) in files if n == "pubspec.yaml"]
     chosen = prefer_shortest(pubs)
-    if not chosen: return None
+    if not chosen:
+        return None
     return f'cd "{chosen.parent}" && flutter build apk --debug'
 
 def probe_go(files: List[Tuple[str, Path]]) -> Optional[str]:
     mods = [p for (n, p) in files if n == "go.mod"]
     chosen = prefer_shortest(mods)
-    if not chosen: return None
+    if not chosen:
+        return None
     return f'cd "{chosen.parent}" && go build ./...'
 
 def probe_bazel(files: List[Tuple[str, Path]]) -> Optional[str]:
     workspaces = [p for (n, p) in files if n in ("workspace", "workspace.bazel", "module.bazel")]
     builds     = [p for (n, p) in files if n in ("build", "build.bazel")]
     root = prefer_shortest(workspaces) or prefer_shortest(builds)
-    if not root: return None
+    if not root:
+        return None
     d = root.parent
     return f'cd "{d}" && (command -v bazelisk >/dev/null 2>&1 && bazelisk build //... || bazel build //...)'
 
@@ -300,14 +338,16 @@ def probe_scons(files: List[Tuple[str, Path]]) -> Optional[str]:
     sconstructs = [p for (n, p) in files if n == "sconstruct"]
     sconss      = [p for (n, p) in files if n == "sconscript"]
     chosen = prefer_shortest(sconstructs) or prefer_shortest(sconss)
-    if not chosen: return None
+    if not chosen:
+        return None
     d = chosen.parent
     return f'scons -C "{d}" -j'
 
 def probe_ninja(files: List[Tuple[str, Path]]) -> Optional[str]:
     ninjas = [p for (n, p) in files if n == "build.ninja"]
     chosen = prefer_shortest(ninjas)
-    if not chosen: return None
+    if not chosen:
+        return None
     return f'ninja -C "{chosen.parent}"'
 
 def main():
@@ -339,7 +379,7 @@ def main():
         "bazel":   probe_bazel,
         "scons":   probe_scons,
         "ninja":   probe_ninja,
-        "windows": probe_dotnet,   # Windows builds often use dotnet/msbuild; reuse
+        "windows": probe_dotnet,   # reuse .NET probing for windows
         "unknown": lambda _f: "echo 'No build system detected' && exit 1",
     }
     func = dispatch.get(ptype, dispatch["unknown"])
