@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
 # AirysDark-AI_detector.py
 #
-# Scans *all files/dirs* in repo to detect build systems.
+# Detects build types by scanning the entire repo (all subfolders / files).
 # Adds:
-#   - CMake content-aware detection to also flag "linux" when the CMakeLists looks desktop-ish.
-#   - Folder-name hints (e.g., "linux", "android", "windows") to augment detection.
-# Writes one PROBE workflow per detected type:
+#   - Folder-name hints (linux / android / windows)
+#   - CMakeLists.txt content inspection (flags linux when desktop-ish)
+#
+# Generates one PROBE workflow per detected type:
 #   .github/workflows/AirysDark-AI_prob_<type>.yml
 #
 # Each PROBE workflow:
-#   - Fetches tools from AirysDark-AI/AirysDark-AI_builder
+#   - Fetches tools from AirysDark-AI/AirysDark-AI_builder (detector, probe, builder)
 #   - Runs AirysDark-AI_probe.py to compute BUILD_CMD
-#   - Generates the final AirysDark-AI_<type>.yml with full build+AI flow
-#   - Opens a PR using token: ${{ secrets.BOT_TOKEN }}
+#   - Writes the final AI workflow .github/workflows/AirysDark-AI_<type>.yml (heredoc)
+#   - Uses peter-evans/create-pull-request with secrets.BOT_TOKEN
+#   - (NEW) Sets checkout persist-credentials: false and pins git remote to BOT_TOKEN
 #
-# Types supported:
-#   android, cmake, linux, node, python, rust, dotnet, maven, flutter, go,
-#   bazel, scons, ninja, unknown
+# Types supported: android, cmake, linux, node, python, rust, dotnet, maven, flutter, go,
+#                  bazel, scons, ninja, unknown
 
 import os
 import pathlib
@@ -48,12 +49,7 @@ def read_text_safe(p: pathlib.Path) -> str:
     except Exception:
         return ""
 
-# ---------- Helpers: folder-name hints ----------
 def collect_dir_name_hints(files):
-    """
-    Return a set of lower-cased directory names seen anywhere in the repo.
-    Includes each path segment from the file paths (not just immediate parents).
-    """
     names = set()
     for _, rel in files:
         for part in pathlib.Path(rel).parts:
@@ -62,12 +58,12 @@ def collect_dir_name_hints(files):
 
 # ---------- CMake classifier ----------
 ANDROID_HINTS = (
-    "android", "android_abi", "android_platform", "ndk", "cmake_android", "gradle", "externalnativebuild",
-    "find_library(log)", "log-lib", "loglib"
+    "android","android_abi","android_platform","ndk","cmake_android","gradle",
+    "externalnativebuild","find_library(log)","log-lib","loglib"
 )
 DESKTOP_HINTS = (
-    "add_executable", "pkgconfig", "find_package(", "threads", "pthread", "x11", "wayland", "gtk", "qt",
-    "set(cmake_system_name linux"
+    "add_executable","pkgconfig","find_package(","threads","pthread","x11",
+    "wayland","gtk","qt","set(cmake_system_name linux"
 )
 
 def cmakelists_flavor(cm_txt: str) -> str:
@@ -87,72 +83,44 @@ def detect_types():
 
     types = []
 
-    # Folder hints
-    if "linux" in dir_hints and "linux" not in types:
-        types.append("linux")
-    if "android" in dir_hints and "android" not in types:
-        types.append("android")
-    if "windows" in dir_hints and "windows" not in types:
-        types.append("windows")
+    # folder-name hints
+    if "linux" in dir_hints and "linux" not in types: types.append("linux")
+    if "android" in dir_hints and "android" not in types: types.append("android")
+    if "windows" in dir_hints and "windows" not in types: types.append("windows")
 
-    # Android / Gradle
+    # gradle / android
     if ("gradlew" in fnames) or any("build.gradle" in n or "settings.gradle" in n for n in fnames):
-        if "android" not in types:
-            types.append("android")
+        if "android" not in types: types.append("android")
 
-    # CMake
+    # cmake (and infer linux when desktop-ish)
     cmake_paths = [p for (n, p) in files if n == "cmakelists.txt"]
     if cmake_paths and "cmake" not in types:
         types.append("cmake")
-    if cmake_paths:
-        for p in cmake_paths:
-            txt = read_text_safe(p)
-            if cmakelists_flavor(txt) == "desktop" and "linux" not in types:
-                types.append("linux")
-
-    # Linux umbrella (Make / Meson / any *.mk)
-    if ("makefile" in fnames) or ("gnumakefile" in fnames) or ("meson.build" in fnames) or any(r.endswith(".mk") for r in rels):
-        if "linux" not in types:
+    for p in cmake_paths:
+        txt = read_text_safe(p)
+        if cmakelists_flavor(txt) == "desktop" and "linux" not in types:
             types.append("linux")
 
-    # Node
-    if "package.json" in fnames and "node" not in types:
-        types.append("node")
-    # Python
-    if ("pyproject.toml" in fnames or "setup.py" in fnames) and "python" not in types:
-        types.append("python")
-    # Rust
-    if "cargo.toml" in fnames and "rust" not in types:
-        types.append("rust")
-    # .NET
-    if any(r.endswith(".sln") or r.endswith(".csproj") or r.endswith(".fsproj") for r in rels) and "dotnet" not in types:
-        types.append("dotnet")
-    # Maven
-    if "pom.xml" in fnames and "maven" not in types:
-        types.append("maven")
-    # Flutter
-    if "pubspec.yaml" in fnames and "flutter" not in types:
-        types.append("flutter")
-    # Go
-    if "go.mod" in fnames and "go" not in types:
-        types.append("go")
-    # Bazel
-    if any(n in ("workspace", "workspace.bazel", "module.bazel") for n in fnames) or \
-       any(os.path.basename(r) in ("build", "build.bazel") for r in rels):
-        if "bazel" not in types:
-            types.append("bazel")
-    # SCons
-    if "sconstruct" in fnames or "sconscript" in fnames:
-        if "scons" not in types:
-            types.append("scons")
-    # Ninja
-    if "build.ninja" in fnames and "ninja" not in types:
-        types.append("ninja")
+    # linux umbrella (make/meson/*.mk)
+    if ("makefile" in fnames) or ("gnumakefile" in fnames) or ("meson.build" in fnames) or any(r.endswith(".mk") for r in rels):
+        if "linux" not in types: types.append("linux")
 
-    if not types:
-        types.append("unknown")
+    if "package.json" in fnames: types.append("node")
+    if "pyproject.toml" in fnames or "setup.py" in fnames: types.append("python")
+    if "cargo.toml" in fnames: types.append("rust")
+    if any(r.endswith(".sln") or r.endswith(".csproj") or r.endswith(".fsproj") for r in rels): types.append("dotnet")
+    if "pom.xml" in fnames: types.append("maven")
+    if "pubspec.yaml" in fnames: types.append("flutter")
+    if "go.mod" in fnames: types.append("go")
+    if any(n in ("workspace","workspace.bazel","module.bazel") for n in fnames) or \
+       any(os.path.basename(r) in ("build","build.bazel") for r in rels):
+        types.append("bazel")
+    if "sconstruct" in fnames or "sconscript" in fnames: types.append("scons")
+    if "build.ninja" in fnames: types.append("ninja")
 
-    # De-dupe preserve order
+    if not types: types.append("unknown")
+
+    # de-dupe preserve order
     seen, out = set(), []
     for t in types:
         if t not in seen:
@@ -160,7 +128,7 @@ def detect_types():
             out.append(t)
     return out
 
-# ---------- Type-specific setup (embedded into final workflow) ----------
+# ---------- Type-specific setup blocks ----------
 def setup_steps_inline(ptype: str) -> str:
     if ptype == "android":
         return textwrap.dedent("""
@@ -233,14 +201,12 @@ def setup_steps_inline(ptype: str) -> str:
               sudo apt-get update
               sudo apt-get install -y ninja-build
         """)
-    # cmake/python/unknown: setup-python only
+    # cmake/python/unknown: only setup-python is needed in the template
     return ""
 
-# ---------- PROBE workflow generator (generic; brace-safe) ----------
+# ---------- PROBE workflow (generic) ----------
 def write_probe_workflow_for_type(ptype: str):
     setup_inline = setup_steps_inline(ptype)
-
-    # Build the YAML using placeholders; then replace so ${{ }} is literal.
     tmpl = r"""
 name: AirysDark-AI — Probe __PTYPE_CAP__
 
@@ -260,7 +226,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
+        with: { fetch-depth: 0, persist-credentials: false }
+
+      - name: Pin git remote with token
+        env:
+          BOT_TOKEN: __GHA__ secrets.BOT_TOKEN __GHA_END__
+          REPO_SLUG: __GHA__ github.repository __GHA_END__
+        run: |
+          git remote set-url origin "https://x-access-token:${BOT_TOKEN}@github.com/${REPO_SLUG}.git"
+          git config --global url."https://x-access-token:${BOT_TOKEN}@github.com/".insteadOf "https://github.com/"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - uses: actions/setup-python@v5
         with: { python-version: "3.11" }
@@ -311,7 +286,16 @@ __SETUP_INLINE__
                 pull-requests: write
               steps:
                 - uses: actions/checkout@v4
-                  with: { fetch-depth: 0 }
+                  with: { fetch-depth: 0, persist-credentials: false }
+
+                - name: Pin git remote with token
+                  env:
+                    BOT_TOKEN: __GHA__ secrets.BOT_TOKEN __GHA_END__
+                    REPO_SLUG: __GHA__ github.repository __GHA_END__
+                  run: |
+                    git remote set-url origin "https://x-access-token:${BOT_TOKEN}@github.com/${REPO_SLUG}.git"
+                    git config --global url."https://x-access-token:${BOT_TOKEN}@github.com/".insteadOf "https://github.com/"
+                    git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
                 - uses: actions/setup-python@v5
                   with: { python-version: "3.11" }
@@ -448,7 +432,6 @@ __SETUP_INLINE__
 # ---------- Android-specific PROBE writer ----------
 def write_probe_workflow_for_android():
     setup_inline = setup_steps_inline("android")
-
     tmpl = r"""
 name: AirysDark-AI — Probe Android
 
@@ -468,7 +451,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
+        with: { fetch-depth: 0, persist-credentials: false }
+
+      - name: Pin git remote with token
+        env:
+          BOT_TOKEN: __GHA__ secrets.BOT_TOKEN __GHA_END__
+          REPO_SLUG: __GHA__ github.repository __GHA_END__
+        run: |
+          git remote set-url origin "https://x-access-token:${BOT_TOKEN}@github.com/${REPO_SLUG}.git"
+          git config --global url."https://x-access-token:${BOT_TOKEN}@github.com/".insteadOf "https://github.com/"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - uses: actions/setup-python@v5
         with: { python-version: "3.11" }
@@ -519,7 +511,16 @@ __SETUP_INLINE__
                 pull-requests: write
               steps:
                 - uses: actions/checkout@v4
-                  with: { fetch-depth: 0 }
+                  with: { fetch-depth: 0, persist-credentials: false }
+
+                - name: Pin git remote with token
+                  env:
+                    BOT_TOKEN: __GHA__ secrets.BOT_TOKEN __GHA_END__
+                    REPO_SLUG: __GHA__ github.repository __GHA_END__
+                  run: |
+                    git remote set-url origin "https://x-access-token:${BOT_TOKEN}@github.com/${REPO_SLUG}.git"
+                    git config --global url."https://x-access-token:${BOT_TOKEN}@github.com/".insteadOf "https://github.com/"
+                    git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
                 - uses: actions/setup-python@v5
                   with: { python-version: "3.11" }
@@ -607,17 +608,6 @@ __SETUP_INLINE__
                     if-no-files-found: ignore
                     retention-days: 7
 
-                - name: Upload Android artifacts
-                  if: always()
-                  uses: actions/upload-artifact@v4
-                  with:
-                    name: android-artifacts
-                    if-no-files-found: ignore
-                    retention-days: 7
-                    path: |
-                      **/build/outputs/**/*.apk
-                      **/build/outputs/**/*.aab
-
                 - name: Check for changes
                   id: diff
                   run: |
@@ -664,9 +654,9 @@ __SETUP_INLINE__
         setup_block = textwrap.indent(setup_inline.rstrip() + "\n", " " * 6)
 
     yaml = (tmpl
-        .replace("__SETUP_INLINE__", setup_block.rstrip("\n"))
-        .replace("__GHA__", "${{")
-        .replace("__GHA_END__", "}}"))
+            .replace("__SETUP_INLINE__", setup_block.rstrip("\n"))
+            .replace("__GHA__", "${{")
+            .replace("__GHA_END__", "}}"))
 
     (WF / "AirysDark-AI_prob_android.yml").write_text(yaml)
     print("✅ Generated: AirysDark-AI_prob_android.yml")
@@ -675,13 +665,11 @@ __SETUP_INLINE__
 def main():
     types = detect_types()
     print("Detected types:", ", ".join(types))
-
     for t in types:
         if t == "android":
             write_probe_workflow_for_android()
         else:
             write_probe_workflow_for_type(t)
-
     print(f"Done. Generated {len(types)} PROBE workflow(s) in {WF}")
 
 if __name__ == "__main__":
