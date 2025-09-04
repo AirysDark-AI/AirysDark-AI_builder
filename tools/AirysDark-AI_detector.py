@@ -238,8 +238,10 @@ def write_probe_workflow_for_type(ptype: str):
 name: AirysDark-AI — Probe __PTYPE_CAP__
 
 on:
-  workflow_dispatch: {}
-  push: "**"
+  workflow_dispatch:
+  push:
+    branches:
+      - "**"
 
 permissions:
   contents: write
@@ -287,9 +289,10 @@ __SETUP_INLINE__
           name: AirysDark-AI — __PTYPE_CAP__ (generated)
 
           on:
-            workflow_dispatch: {}
-            push: "**"
-            pull_request: {}
+  workflow_dispatch:
+  push:
+    branches:
+      - "**"
 
           jobs:
             build:
