@@ -27,53 +27,24 @@ jobs:
       run:
         working-directory: backend   # or android, app, etc.
 ```
-### Create workflow
-create this file innyour repo:
-```y.github/workflows/autobuilder.yml
-```
-copy and past this inside:
+
+## Use from another repo (reusable workflow)
+Add this to the *other* repo’s `.github/workflows/autobuilder.yml`:
 ```yaml
-name: AirysDark-AI_detector
+name: Project Autobuilder (AirysDark-AI Reusable)
 
 on:
   workflow_dispatch:
-
-permissions:
-  contents: write
-  pull-requests: write
+  push:
+  pull_request:
 
 jobs:
-  bootstrap:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install deps
-        run: pip install requests pyyaml
-
-      - name: Generate workflows + AirysDark-AI script
-        run: python3 tools/AirysDark-AI_detector.py
-
-      - name: Create PR with generated workflows
-        uses: peter-evans/create-pull-request@v6
-        with:
-          branch: ai/airysdark-ai-bootstrap
-          title: "AirysDark-AI: bootstrap (multi-purpose)"
-          commit-message: "chore: generate AirysDark-AI workflows + script (multi-purpose)"
-          body: |
-            This PR was created by the bootstrap workflow.
-            - Detects project type (android / cmake / node / python / rust / dotnet / maven / flutter / go / unknown)
-            - Generates a matching CI workflow with build capture
-            - Adds AirysDark-AirysDark-AI (OpenAI ? llama fallback) and TinyLlama GGUF fetch
-          labels: automation, ci
-
-
+  autobuild:
+    uses: AirysDark/AirysDark-AI_Builder/.github/workflows/AirysDark-AI_universal.yml@main
+    secrets: inherit
+    with:
+      project_dir: "."        # or "android", "backend", etc.
+      # build_cmd: "custom build command (optional)"
 ```
 
 This will:
