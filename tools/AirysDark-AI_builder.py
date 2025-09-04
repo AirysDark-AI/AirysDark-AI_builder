@@ -176,7 +176,7 @@ def apply_patch(diff_text):
         run("git diff --staged > .pre_ai_fix.patch || true")
         run(f"git apply --reject --whitespace=fix {tmp.name}", capture=True)
         git("add", "-A")
-        run('git commit -m "ai-autobuilder: apply automatic fix" || true')
+        run('git commit -m "AirysDark-AI: apply automatic fix" || true')
         return True
     except Exception as e:
         print("Patch apply failed:", e)
@@ -186,7 +186,7 @@ def apply_patch(diff_text):
 
 # -------- main --------
 def main():
-    print("== AI Autobuilder (OpenAI → llama fallback) ==")
+    print("== AirysDark-AI (OpenAI → llama fallback) ==")
     print("Project:", PROJECT_ROOT)
     print(f"Provider: {PROVIDER}, Model: {OPENAI_MODEL}, Fallback: {FALLBACK_PROVIDER}")
     if not (PROJECT_ROOT / ".git").exists():
@@ -194,7 +194,7 @@ def main():
         run('git config user.name "AirysDark-AI_builder"')
         run('git config user.email "AirysDark-AI_builder@users.noreply.github.com"')
         git("add", "-A")
-        run('git commit -m "ai-autobuilder: initial snapshot" || true')
+        run('git commit -m "AirysDark-AI: initial snapshot" || true')
 
     code = run_build()
     if code == 0:

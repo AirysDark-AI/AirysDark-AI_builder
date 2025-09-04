@@ -22,7 +22,7 @@ jobs:
       - name: Install deps
         run: pip install requests pyyaml
 
-      - name: Generate workflows + autobuilder script
+      - name: Generate workflows + AirysDark-AI script
         run: python3 tools/AirysDark-AI_detector.py
 
       - name: Create PR with generated workflows
@@ -35,5 +35,5 @@ jobs:
             This PR was created by the bootstrap workflow.
             - Detects project type (android / cmake / node / python / rust / dotnet / maven / flutter / go / unknown)
             - Generates a matching CI workflow with build capture
-            - Adds AirysDark-AI autobuilder (OpenAI → llama fallback) and TinyLlama GGUF fetch
+            - Adds AirysDark-AirysDark-AI (OpenAI → llama fallback) and TinyLlama GGUF fetch
           labels: automation, ci

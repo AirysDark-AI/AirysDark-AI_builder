@@ -159,12 +159,12 @@ AI_STEP = """      - name: Configure git identity
           branch: ai/autofix-${{ github.run_id }}
           title: "AirysDark-AI: build fix"
           body: |
-            Automated fix from AirysDark-AI autobuilder.
+            Automated fix from AirysDark-AirysDark-AI.
             • Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
             • Artifacts include build.log and any proposed patch (.pre_ai_fix.patch)
           commit-message: "AirysDark-AI: apply automatic fix"
           labels: |
-            autobuilder
+            AirysDark-AI
             bot
           add-paths: |
             **/*
