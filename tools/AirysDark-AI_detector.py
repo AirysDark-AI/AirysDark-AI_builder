@@ -239,7 +239,7 @@ name: AirysDark-AI — Probe __PTYPE_CAP__
 
 on:
   workflow_dispatch: {}
-  push: { branches: ["**"] }
+  push: "**"
 
 permissions:
   contents: write
@@ -288,7 +288,7 @@ __SETUP_INLINE__
 
           on:
             workflow_dispatch: {}
-            push: { branches: ["**"] }
+            push: "**"
             pull_request: {}
 
           jobs:
