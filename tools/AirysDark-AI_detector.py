@@ -1,32 +1,20 @@
 #!/usr/bin/env python3
-# AirysDark-AI_detector.py
-#
-# Scans *all files/dirs* in repo to detect build systems.
-# For each detected type, writes a PROBE workflow:
-#   .github/workflows/AirysDark-AI_prob_<type>.yml
-#
-# When a PROBE workflow runs, it will:
-#   - fetch tools (detector/probe/builder) from canonical repo
-#   - run AirysDark-AI_probe.py to compute BUILD_CMD
-#   - generate the final AI build workflow: .github/workflows/AirysDark-AI_<type>.yml
-#   - open a PR with BOT_TOKEN to add that workflow
-#
-# Types: android, cmake, linux (Make/Meson), node, python, rust, dotnet, maven, flutter, go, unknown
+# AirysDark-AI_detector.py — detects build types by scanning the entire repo
+# Writes one PROBE workflow per detected type: .github/workflows/AirysDark-AI_prob_<type>.yml
 
 import os
 import pathlib
 import textwrap
 import sys
+from collections import Counter
 
 ROOT = pathlib.Path(os.getenv("PROJECT_DIR", ".")).resolve()
 WF = ROOT / ".github" / "workflows"
 WF.mkdir(parents=True, exist_ok=True)
 
-# ---------- Full-repo scan ----------
 def scan_all_files():
     files = []
     for root, dirs, filenames in os.walk(ROOT):
-        # Skip VCS / caches
         if ".git" in dirs:
             dirs.remove(".git")
         for fn in filenames:
@@ -44,14 +32,18 @@ def detect_types():
     rels   = [str(p).lower() for _, p in files]
 
     types = []
+
     # Android / Gradle
     if ("gradlew" in fnames) or any("build.gradle" in n or "settings.gradle" in n for n in fnames):
         types.append("android")
     # CMake
     if "cmakelists.txt" in fnames:
         types.append("cmake")
-    # Linux (Make / Meson)
-    if "makefile" in fnames or "meson.build" in fnames:
+    # Linux (Make / GNUmakefile / Meson / *.mk)
+    has_makefile    = ("makefile" in fnames) or ("gnumakefile" in fnames)
+    has_meson       = ("meson.build" in fnames)
+    has_any_mk      = any(r.endswith(".mk") for r in rels)
+    if has_makefile or has_meson or has_any_mk:
         types.append("linux")
     # Node
     if "package.json" in fnames:
@@ -78,7 +70,6 @@ def detect_types():
     if not types:
         types.append("unknown")
 
-    # de-dupe preserve order
     seen, out = set(), []
     for t in types:
         if t not in seen:
@@ -86,7 +77,6 @@ def detect_types():
             out.append(t)
     return out
 
-# ---------- Type-specific setup (embedded into final workflow) ----------
 def setup_steps_inline(ptype: str) -> str:
     if ptype == "android":
         return textwrap.dedent("""
@@ -141,13 +131,10 @@ def setup_steps_inline(ptype: str) -> str:
               sudo apt-get update
               sudo apt-get install -y meson ninja-build pkg-config
         """)
-    # cmake/python/unknown: setup-python only (added in final workflow)
     return ""
 
-# ---------- Write PROBE workflow for a given type ----------
 def write_probe_workflow_for_type(ptype: str):
     setup_inline = setup_steps_inline(ptype)
-
     yaml = f"""
     name: AirysDark-AI — Probe {ptype.capitalize()}
 
@@ -250,7 +237,6 @@ def write_probe_workflow_for_type(ptype: str):
                         if-no-files-found: warn
                         retention-days: 7
 
-                    # --- AI auto-fix (OpenAI → llama.cpp) ---
                     - name: Build llama.cpp (CMake, no CURL, in temp)
                       if: always() && steps.build.outputs.EXIT_CODE != '0'
                       run: |
@@ -361,7 +347,6 @@ def write_probe_workflow_for_type(ptype: str):
     (WF / f"AirysDark-AI_prob_{ptype}.yml").write_text(textwrap.dedent(yaml))
     print(f"✅ Generated: AirysDark-AI_prob_{ptype}.yml")
 
-# ---------- Main ----------
 def main():
     types = detect_types()
     for t in types:
