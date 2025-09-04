@@ -1,15 +1,8 @@
 #!/usr/bin/env python3
-# AirysDark-AI_detector.py
+# AirysDark-AI_detector.py (updated with Linux/Makefile detection)
+#
 # Detects project type(s) and generates ready-to-run workflows:
 #   .github/workflows/AirysDark-AI_<type>.yml
-#
-# Each generated workflow:
-# - triggers on push / PR / manual dispatch (Run button) and is reusable (workflow_call)
-# - installs language/toolchain where needed
-# - ensures tools/ has the AI scripts (fetch from AirysDark-AI org if missing)
-# - runs the build, captures build.log
-# - if it fails, runs the AI autobuilder (OpenAI → llama.cpp fallback)
-# - opens a PR with changes using a PAT (secrets.BOT_TOKEN) with repo+workflow scopes
 
 import os
 import pathlib
@@ -56,6 +49,10 @@ def detect_types():
     # go
     if (ROOT / "go.mod").exists():
         types.append("go")
+    # linux / makefile
+    if (ROOT / "Makefile").exists() or exists_any(["**/Makefile"]):
+        types.append("linux")
+
     if not types:
         types.append("unknown")
     return types
@@ -71,6 +68,7 @@ BUILD_CMDS = {
     "maven":   "mvn -B package --file pom.xml",
     "flutter": "flutter build apk --debug",
     "go":      "go build ./...",
+    "linux":   "make -j",
     "unknown": "echo 'No build system detected' && exit 1",
 }
 
@@ -122,13 +120,12 @@ def setup_steps(ptype: str) -> str:
             with: { go-version: "1.22" }
           - run: go version
         """)
-    # cmake/python/unknown don't need extra setup beyond setup-python
+    # cmake/python/linux/unknown don't need extra setup beyond setup-python
     return ""
 
-# ---------- YAML write (UPDATED) ----------
+# ---------- Workflow writer ----------
 def write_workflow(ptype: str, cmd: str):
     setup = setup_steps(ptype)
-    # Expanded triggers include workflow_dispatch (Run button) and workflow_call (reusable)
     yaml = f"""
     name: AirysDark-AI — {ptype.capitalize()} (generated)
 
@@ -175,7 +172,6 @@ def write_workflow(ptype: str, cmd: str):
               exit 0
             continue-on-error: true
 
-          # --- AI auto-fix block (OpenAI → llama fallback) ---
           - name: Build llama.cpp (CMake, no CURL)
             run: |
               git clone --depth=1 https://github.com/ggml-org/llama.cpp
@@ -202,7 +198,6 @@ def write_workflow(ptype: str, cmd: str):
               BUILD_CMD: ${{{{ steps.build.outputs.BUILD_CMD }}}}
             run: python3 tools/AirysDark-AI_builder.py || true
 
-          # --- Only open PR if changes exist (use PAT with workflow scope) ---
           - name: Check for changes
             id: diff
             run: |
@@ -217,7 +212,7 @@ def write_workflow(ptype: str, cmd: str):
             if: steps.diff.outputs.changed == 'true'
             uses: peter-evans/create-pull-request@v6
             with:
-              token: ${{{{ secrets.BOT_TOKEN }}}}   # PAT with repo + workflow scopes
+              token: ${{{{ secrets.BOT_TOKEN }}}}
               branch: ai/airysdark-ai-autofix
               commit-message: "chore: AirysDark-AI auto-fix"
               title: "AirysDark-AI: automated build fix"
