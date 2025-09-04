@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-# AirysDark-AI_detector.py (updated with Linux/Makefile detection)
-#
-# Detects project type(s) and generates ready-to-run workflows:
-#   .github/workflows/AirysDark-AI_<type>.yml
+# AirysDark-AI_detector.py (updated: recursive detection for all project types)
 
 import os
 import pathlib
@@ -15,6 +12,7 @@ WF.mkdir(parents=True, exist_ok=True)
 
 # ---------- Helpers ----------
 def exists_any(patterns):
+    """Return True if any glob pattern matches anywhere in repo (recursive)."""
     for pat in patterns:
         if list(ROOT.glob(pat)):
             return True
@@ -23,34 +21,34 @@ def exists_any(patterns):
 def detect_types():
     types = []
     # android / gradle
-    if (ROOT / "gradlew").exists() or exists_any(["**/gradlew", "**/build.gradle*", "**/settings.gradle*"]):
+    if exists_any(["**/gradlew", "**/build.gradle*", "**/settings.gradle*"]):
         types.append("android")
     # cmake
-    if (ROOT / "CMakeLists.txt").exists() or exists_any(["**/CMakeLists.txt"]):
+    if exists_any(["**/CMakeLists.txt"]):
         types.append("cmake")
     # node
-    if (ROOT / "package.json").exists():
+    if exists_any(["**/package.json"]):
         types.append("node")
     # python
-    if (ROOT / "setup.py").exists() or (ROOT / "pyproject.toml").exists():
+    if exists_any(["**/setup.py", "**/pyproject.toml"]):
         types.append("python")
     # rust
-    if (ROOT / "Cargo.toml").exists():
+    if exists_any(["**/Cargo.toml"]):
         types.append("rust")
     # dotnet
-    if exists_any(["*.sln", "**/*.csproj", "**/*.fsproj"]):
+    if exists_any(["**/*.sln", "**/*.csproj", "**/*.fsproj"]):
         types.append("dotnet")
     # maven
-    if (ROOT / "pom.xml").exists():
+    if exists_any(["**/pom.xml"]):
         types.append("maven")
     # flutter
-    if (ROOT / "pubspec.yaml").exists():
+    if exists_any(["**/pubspec.yaml"]):
         types.append("flutter")
     # go
-    if (ROOT / "go.mod").exists():
+    if exists_any(["**/go.mod"]):
         types.append("go")
     # linux / makefile
-    if (ROOT / "Makefile").exists() or exists_any(["**/Makefile"]):
+    if exists_any(["**/Makefile"]):
         types.append("linux")
 
     if not types:
