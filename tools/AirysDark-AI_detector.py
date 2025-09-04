@@ -3,11 +3,8 @@
 # - Recursive detection for all project types (whole repo)
 # - Generates one workflow per detected type:
 #     .github/workflows/AirysDark-AI_<type>.yml
-# - Android: robust multi-module detection & build task discovery
-# - Linux: Makefile or Meson/Ninja
-# - CMake: top-level or first found subdir
-# - Uploads build.log, AI patch, and common outputs as artifacts
-# - Uses PAT (secrets.BOT_TOKEN) for PR creation (needed to PR workflow files)
+# - Uses a Probe step (AirysDark-AI_probe.py) to find the correct build command
+# - Build → AI auto-fix (OpenAI → llama.cpp in runner temp) → PR → Artifacts
 
 import os
 import pathlib
@@ -55,7 +52,7 @@ def detect_types():
     # go
     if exists_any(["**/go.mod"]):
         types.append("go")
-    # linux: Makefile, meson.build, *.mk, or a linux/ dir
+    # linux: Makefile / meson.build / *.mk / or linux dir present
     if exists_any(["**/Makefile", "**/*.mk", "**/meson.build", "linux", "linux/**"]):
         types.append("linux")
 
@@ -69,138 +66,6 @@ def detect_types():
             seen.add(t)
             deduped.append(t)
     return deduped
-
-# ---------- Build commands (smart subdir resolution) ----------
-BUILD_CMDS = {
-    # ANDROID:
-    # - Try root gradlew; else try every gradlew in the repo
-    # - Discover modules via settings.gradle[.kts] include(":app", ":mobile", ...)
-    # - Discover app modules via com.android.application plugin in build.gradle[.kts]
-    # - Try assembleDebug / :module:assembleDebug / assembleRelease / :module:assembleRelease / build
-    "android": (
-        "bash -lc '"
-        "set -euo pipefail; "
-        "run_gradle() { "
-        "  g=$1; d=$(dirname \"$g\"); chmod +x \"$g\" || true; "
-        "  echo \"[Android] using gradle at: $d\"; "
-        "  cd \"$d\"; "
-        "  # collect candidate modules from settings.gradle/settings.gradle.kts includes "
-        "  mods=\"\"; "
-        "  for s in settings.gradle settings.gradle.kts; do "
-        "    if [ -f \"$s\" ]; then "
-        "      ms=$(grep -E \"^[[:space:]]*include\\(\" \"$s\" | sed -E \"s/.*include\\((.*)\\).*/\\1/\" | tr -d \"\\\"'[:space:]\" | tr \",\" \"\\n\" | sed \"s/^://\"); "
-        "      if [ -n \"$ms\" ]; then mods=\"$mods $ms\"; fi; "
-        "    fi; "
-        "  done; "
-        "  # add modules that apply the Android application plugin "
-        "  ms_app=$(git ls-files | grep -E \"(^|/)(build.gradle|build.gradle.kts)$\" | while read -r f; do "
-        "    if grep -qE \"com\\.android\\.application\" \"$f\"; then "
-        "      echo \"${f%/*}\" | sed -E \"s#^\\./?##; s#/#:#g\"; "
-        "    fi; "
-        "  done | sed \"s#^#:##\"); "
-        "  mods=\"$mods $ms_app\"; "
-        "  # common guesses "
-        "  mods=\"$mods app mobile android\"; "
-        "  # normalize unique module list "
-        "  umods=\"\"; for m in $mods; do [ -n \"$m\" ] && case \" $umods \" in *\" $m \"*) ;; *) umods=\"$umods $m\";; esac; done; "
-        "  echo \"[Android] candidate modules:$umods\"; "
-        "  # try task permutations "
-        "  set +e; "
-        "  ./gradlew assembleDebug --stacktrace && exit 0; "
-        "  for m in $umods; do ./gradlew :$m:assembleDebug --stacktrace && exit 0; done; "
-        "  ./gradlew assembleRelease --stacktrace && exit 0; "
-        "  for m in $umods; do ./gradlew :$m:assembleRelease --stacktrace && exit 0; done; "
-        "  ./gradlew build --stacktrace && exit 0; "
-        "  exit 1; "
-        "}; "
-        "if [ -x ./gradlew ]; then "
-        "  run_gradle ./gradlew; "
-        "else "
-        "  ok=; "
-        "  for g in $(git ls-files | grep -E \"(^|/)gradlew$\" | sort); do "
-        "    run_gradle \"$g\" && ok=1 && break || true; "
-        "  done; "
-        "  [ -n \"$ok\" ] || { echo \"No working gradlew found\"; exit 1; }; "
-        "fi'"
-    ),
-
-    # CMAKE: top-level or first subdir with CMakeLists.txt
-    "cmake": (
-        "bash -lc '"
-        "set -e; "
-        "if [ -f CMakeLists.txt ]; then "
-        "  cmake -S . -B build && cmake --build build -j; "
-        "else "
-        "  t=$(git ls-files | grep -E \"(^|/)CMakeLists\\.txt$\" | head -n1 | xargs -I{} dirname {} || true); "
-        "  if [ -n \"$t\" ]; then "
-        "    cmake -S \"$t\" -B \"build/${t//\\//_}\" && cmake --build \"build/${t//\\//_}\" -j; "
-        "  else "
-        "    echo \"No CMakeLists.txt found\"; exit 1; "
-        "  fi; "
-        "fi'"
-    ),
-
-    # NODE: root or first subdir with package.json
-    "node": (
-        "bash -lc '"
-        "set -e; "
-        "if [ -f package.json ]; then "
-        "  npm ci && npm run build --if-present; "
-        "else "
-        "  ok=; shopt -s globstar nullglob; "
-        "  for p in **/package.json; do d=${p%/*}; "
-        "    (cd \"$d\" && npm ci && npm run build --if-present) && ok=1 && break || true; "
-        "  done; "
-        "  [ -n \"$ok\" ] || { echo \"No package.json built\"; exit 1; }; "
-        "fi'"
-    ),
-
-    # PYTHON: root or any subdir with pyproject/setup
-    "python": (
-        "bash -lc '"
-        "set -e; "
-        "if [ -f pyproject.toml ] || [ -f setup.py ]; then "
-        "  pip install -e .; (pytest || python -m pytest || true); "
-        "else "
-        "  ok=; shopt -s globstar nullglob; "
-        "  for t in **/pyproject.toml **/setup.py; do d=${t%/*}; "
-        "    (cd \"$d\" && pip install -e . && (pytest || python -m pytest || true)) && ok=1 && break || true; "
-        "  done; "
-        "  [ -n \"$ok\" ] || { echo \"No python project found\"; exit 1; }; "
-        "fi'"
-    ),
-
-    "rust":   "cargo build --locked --all-targets --verbose",
-    "dotnet": "bash -lc 'set -e; dotnet restore; dotnet build -c Release'",
-    "maven":  "mvn -B package --file pom.xml",
-    "flutter":"flutter build apk --debug",
-    "go":     "go build ./...",
-
-    # LINUX: Makefile (root or first found) → make; else Meson/Ninja (root or first found)
-    "linux": (
-        "bash -lc '"
-        "set -e; "
-        "if [ -f Makefile ]; then "
-        "  make -j; "
-        "else "
-        "  d=$(git ls-files | grep -E \"(^|/)Makefile$\" | head -n1 | xargs -I{} dirname {} || true); "
-        "  if [ -n \"$d\" ]; then "
-        "    make -C \"$d\" -j; "
-        "  elif [ -f meson.build ]; then "
-        "    (meson setup build --wipe || true); meson setup build || true; ninja -C build; "
-        "  else "
-        "    m=$(git ls-files | grep -E \"(^|/)meson\\.build$\" | head -n1 | xargs -I{} dirname {} || true); "
-        "    if [ -n \"$m\" ]; then "
-        "      (cd \"$m\" && (meson setup build --wipe || true); meson setup build || true; ninja -C build); "
-        "    else "
-        "      echo \"No Makefile or meson.build found\"; exit 1; "
-        "    fi; "
-        "  fi; "
-        "fi'"
-    ),
-
-    "unknown": "echo 'No build system detected' && exit 1",
-}
 
 # ---------- Type-specific setup ----------
 def setup_steps(ptype: str) -> str:
@@ -257,11 +122,11 @@ def setup_steps(ptype: str) -> str:
               sudo apt-get update
               sudo apt-get install -y meson ninja-build pkg-config
         """)
-    # cmake/python/unknown don't need extra setup beyond setup-python
+    # cmake / python / unknown: no extra beyond setup-python
     return ""
 
-# ---------- Workflow writer (with artifacts + temp llama.cpp) ----------
-def write_workflow(ptype: str, cmd: str):
+# ---------- Workflow writer (Probe → Build → AI → PR → Artifacts) ----------
+def write_workflow(ptype: str):
     setup = setup_steps(ptype)
     yaml = f"""
     name: AirysDark-AI — {ptype.capitalize()} (generated)
@@ -280,6 +145,7 @@ def write_workflow(ptype: str, cmd: str):
           pull-requests: write
         steps:
           - uses: actions/checkout@v4
+            with: {{ fetch-depth: 0 }}
 
           - uses: actions/setup-python@v5
             with: {{ python-version: "3.11" }}
@@ -294,14 +160,24 @@ def write_workflow(ptype: str, cmd: str):
               BASE_URL="https://raw.githubusercontent.com/AirysDark-AI/AirysDark-AI_builder/main/tools"
               [ -f tools/AirysDark-AI_detector.py ] || curl -fL "$BASE_URL/AirysDark-AI_detector.py" -o tools/AirysDark-AI_detector.py
               [ -f tools/AirysDark-AI_builder.py ]  || curl -fL "$BASE_URL/AirysDark-AI_builder.py"  -o tools/AirysDark-AI_builder.py
+              [ -f tools/AirysDark-AI_probe.py ]    || curl -fL "$BASE_URL/AirysDark-AI_probe.py"    -o tools/AirysDark-AI_probe.py
               ls -la tools
+
+          - name: Probe build command
+            id: probe
+            shell: bash
+            run: |
+              set -euxo pipefail
+              python3 tools/AirysDark-AI_probe.py --type "{ptype}" | tee /tmp/probe.out
+              CMD=$(grep -E '^BUILD_CMD=' /tmp/probe.out | sed 's/^BUILD_CMD=//')
+              echo "BUILD_CMD=$CMD" >> "$GITHUB_OUTPUT"
 
           - name: Build (capture)
             id: build
             shell: bash
             run: |
               set -euxo pipefail
-              CMD="{cmd}"
+              CMD="${{{{ steps.probe.outputs.BUILD_CMD }}}}"
               echo "BUILD_CMD=$CMD" >> "$GITHUB_OUTPUT"
               set +e; bash -lc "$CMD" | tee build.log; EXIT=$?; set -e
               echo "EXIT_CODE=$EXIT" >> "$GITHUB_OUTPUT"
@@ -309,7 +185,6 @@ def write_workflow(ptype: str, cmd: str):
               exit 0
             continue-on-error: true
 
-          # --- Upload build log early so you always get it ---
           - name: Upload build log
             if: always()
             uses: actions/upload-artifact@v4
@@ -349,10 +224,9 @@ def write_workflow(ptype: str, cmd: str):
               OPENAI_MODEL: ${{{{ vars.OPENAI_MODEL || 'gpt-4o-mini' }}}}
               MODEL_PATH: models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
               AI_BUILDER_ATTEMPTS: "3"
-              BUILD_CMD: ${{{{ steps.build.outputs.BUILD_CMD }}}}
+              BUILD_CMD: ${{{{ steps.probe.outputs.BUILD_CMD }}}}
             run: python3 tools/AirysDark-AI_builder.py || true
 
-          # --- Upload any auto-fix patch the AI created ---
           - name: Upload AI patch (if any)
             if: always()
             uses: actions/upload-artifact@v4
@@ -362,7 +236,6 @@ def write_workflow(ptype: str, cmd: str):
               if-no-files-found: ignore
               retention-days: 7
 
-          # --- Upload build outputs (best-effort, cross-ecosystem) ---
           - name: Upload build artifacts
             if: always()
             uses: actions/upload-artifact@v4
@@ -389,14 +262,13 @@ def write_workflow(ptype: str, cmd: str):
                 **/outputs/**/*.aab
                 **/*.whl
 
-          # --- Only open PR if changes exist (use PAT with workflow scope) ---
           - name: Check for changes
             id: diff
             run: |
               git add -A
               if git diff --cached --quiet; then
                 echo "changed=false" >> "$GITHUB_OUTPUT"
-              else
+              else:
                 echo "changed=true" >> "$GITHUB_OUTPUT"
               fi
 
@@ -410,6 +282,7 @@ def write_workflow(ptype: str, cmd: str):
               title: "AirysDark-AI: automated build fix"
               body: |
                 This PR was opened automatically by a generated workflow after a failed build.
+                - Probed command: ${{{{ steps.probe.outputs.BUILD_CMD }}}}}
                 - Captured the failing build log
                 - Proposed a minimal fix via AI
                 - Committed the changes for review
@@ -423,7 +296,7 @@ def write_workflow(ptype: str, cmd: str):
 def main():
     types = detect_types()
     for t in types:
-        write_workflow(t, BUILD_CMDS[t])
+        write_workflow(t)
     print(f"Done. Generated {len(types)} workflow(s) in {WF}")
 
 if __name__ == "__main__":
