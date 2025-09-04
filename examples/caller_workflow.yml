@@ -1,0 +1,15 @@
+# Copy this into ANOTHER repo as .github/workflows/autobuilder.yml
+name: Project Autobuilder (AirysDark-AI Reusable)
+
+on:
+  workflow_dispatch:
+  push:
+  pull_request:
+
+jobs:
+  autobuild:
+    uses: AirysDark/AirysDark-AI_Builder/.github/workflows/AirysDark-AI_universal.yml@main
+    secrets: inherit
+    with:
+      project_dir: "."
+      # build_cmd: "custom build command (optional)"

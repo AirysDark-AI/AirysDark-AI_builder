@@ -1,0 +1,68 @@
+# === General ===
+.DS_Store
+Thumbs.db
+*.log
+*.patch
+*.zip
+*.tar
+*.tar.gz
+
+# === Python ===
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.env
+.env.*
+dist/
+build/
+*.pytest_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# === Node ===
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-store/
+dist/
+build/
+
+# === Java/Gradle/Android ===
+.gradle/
+build/
+**/build/
+**/.gradle/
+local.properties
+*.iml
+.idea/
+captures/
+*.keystore
+*.jks
+
+# === CMake ===
+CMakeFiles/
+CMakeCache.txt
+cmake-build-*/
+build/
+
+# === Rust ===
+target/
+
+# === Go ===
+bin/
+pkg/
+
+# === Flutter ===
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+pubspec.lock
+build/
+
+# === LLM / Models (keep cached models out of VCS) ===
+models/
+llama.cpp/build/
