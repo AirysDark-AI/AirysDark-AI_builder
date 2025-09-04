@@ -162,7 +162,7 @@ def write_workflow(ptype: str, cmd: str):
             continue-on-error: true
 {common_ai()}
     """
-    out = WF / f"ai-autobuilder-{ptype}.yml"
+    out = WF / f"AirysDark-AI_{ptype}.yml"
     out.write_text(textwrap.dedent(yaml))
     print(f"✅ Generated: {out.name}")
 
