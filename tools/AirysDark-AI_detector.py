@@ -1,17 +1,30 @@
 #!/usr/bin/env python3
-# AirysDark-AI_detector.py — detects build types by scanning the entire repo
-# Writes one PROBE workflow per detected type: .github/workflows/AirysDark-AI_prob_<type>.yml
+# AirysDark-AI_detector.py
+#
+# Scans *all files/dirs* in repo to detect build systems.
+# For each detected type, writes a PROBE workflow:
+#   .github/workflows/AirysDark-AI_prob_<type>.yml
+#
+# When a PROBE workflow runs, it will:
+#   - fetch tools (detector/probe/builder) from canonical repo
+#   - run AirysDark-AI_probe.py to compute BUILD_CMD
+#   - generate the final AI build workflow: .github/workflows/AirysDark-AI_<type>.yml
+#   - open a PR with BOT_TOKEN to add that workflow
+#
+# Types:
+#   android, cmake, linux (Make/Meson/*.mk), node, python, rust, dotnet, maven, flutter, go,
+#   bazel, scons, ninja, unknown
 
 import os
 import pathlib
 import textwrap
 import sys
-from collections import Counter
 
 ROOT = pathlib.Path(os.getenv("PROJECT_DIR", ".")).resolve()
 WF = ROOT / ".github" / "workflows"
 WF.mkdir(parents=True, exist_ok=True)
 
+# ---------- Full-repo scan ----------
 def scan_all_files():
     files = []
     for root, dirs, filenames in os.walk(ROOT):
@@ -39,11 +52,8 @@ def detect_types():
     # CMake
     if "cmakelists.txt" in fnames:
         types.append("cmake")
-    # Linux (Make / GNUmakefile / Meson / *.mk)
-    has_makefile    = ("makefile" in fnames) or ("gnumakefile" in fnames)
-    has_meson       = ("meson.build" in fnames)
-    has_any_mk      = any(r.endswith(".mk") for r in rels)
-    if has_makefile or has_meson or has_any_mk:
+    # Linux (Make / Meson / any *.mk)
+    if "makefile" in fnames or "gnumakefile" in fnames or "meson.build" in fnames or any(r.endswith(".mk") for r in rels):
         types.append("linux")
     # Node
     if "package.json" in fnames:
@@ -66,10 +76,22 @@ def detect_types():
     # Go
     if "go.mod" in fnames:
         types.append("go")
+    # Bazel
+    if any(n in ("workspace", "workspace.bazel", "module.bazel") for n in fnames) or \
+       any(r.endswith("/build") or r.endswith("/build.bazel") for r in rels) or \
+       any(os.path.basename(r) in ("build", "build.bazel") for r in rels):
+        types.append("bazel")
+    # SCons
+    if "sconstruct" in fnames or "sconscript" in fnames:
+        types.append("scons")
+    # Ninja (direct build.ninja present)
+    if "build.ninja" in fnames:
+        types.append("ninja")
 
     if not types:
         types.append("unknown")
 
+    # de-dupe preserve order
     seen, out = set(), []
     for t in types:
         if t not in seen:
@@ -77,6 +99,7 @@ def detect_types():
             out.append(t)
     return out
 
+# ---------- Type-specific setup (embedded into final workflow) ----------
 def setup_steps_inline(ptype: str) -> str:
     if ptype == "android":
         return textwrap.dedent("""
@@ -131,10 +154,31 @@ def setup_steps_inline(ptype: str) -> str:
               sudo apt-get update
               sudo apt-get install -y meson ninja-build pkg-config
         """)
+    if ptype == "bazel":
+        return textwrap.dedent("""
+          - uses: bazelbuild/setup-bazelisk@v3
+        """)
+    if ptype == "scons":
+        return textwrap.dedent("""
+          - name: Install SCons
+            run: |
+              sudo apt-get update
+              sudo apt-get install -y scons
+        """)
+    if ptype == "ninja":
+        return textwrap.dedent("""
+          - name: Ensure Ninja
+            run: |
+              sudo apt-get update
+              sudo apt-get install -y ninja-build
+        """)
+    # cmake/python/unknown: setup-python only
     return ""
 
+# ---------- PROBE workflow generator ----------
 def write_probe_workflow_for_type(ptype: str):
     setup_inline = setup_steps_inline(ptype)
+
     yaml = f"""
     name: AirysDark-AI — Probe {ptype.capitalize()}
 
@@ -237,6 +281,7 @@ def write_probe_workflow_for_type(ptype: str):
                         if-no-files-found: warn
                         retention-days: 7
 
+                    # --- AI auto-fix (OpenAI → llama.cpp) ---
                     - name: Build llama.cpp (CMake, no CURL, in temp)
                       if: always() && steps.build.outputs.EXIT_CODE != '0'
                       run: |
@@ -347,6 +392,7 @@ def write_probe_workflow_for_type(ptype: str):
     (WF / f"AirysDark-AI_prob_{ptype}.yml").write_text(textwrap.dedent(yaml))
     print(f"✅ Generated: AirysDark-AI_prob_{ptype}.yml")
 
+# ---------- Main ----------
 def main():
     types = detect_types()
     for t in types:

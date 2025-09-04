@@ -44,36 +44,57 @@ def print_output_var(name: str, val: str):
 
 # -------- Linux (Make/Meson/only .mk) --------
 def probe_linux(files: List[Tuple[str, Path]]) -> Optional[str]:
-    names = [n for n, _ in files]
-    paths = [p for _, p in files]
-
-    # Prefer a real Makefile or GNUmakefile
+    # Prefer real Makefile/GNUmakefile
     makefiles = [p for (n, p) in files if n in ("makefile", "gnumakefile")]
     mf = prefer_shortest(makefiles)
     if mf:
         if str(mf.parent) == ".":
             return "make -j"
         return f'make -C "{mf.parent}" -j'
-
-    # Meson/Ninja
+    # Meson
     mesons = [p for (n, p) in files if n == "meson.build"]
     mb = prefer_shortest(mesons)
     if mb:
         d = mb.parent
         return f'(cd "{d}" && (meson setup build --wipe || true); meson setup build || true; ninja -C build)'
-
-    # If we only have *.mk files, try best-effort:
+    # Only .mk files
     mk_paths = [p for (n, p) in files if str(p).lower().endswith(".mk")]
     if mk_paths:
-        # pick the directory with the highest count of .mk as a likely build root
         cnt = Counter(str(p.parent) for p in mk_paths)
         likely_dir = Path(sorted(cnt.items(), key=lambda kv: (-kv[1], len(Path(kv[0]).parts)))[0][0])
-        # Try a plain make there (many top-level makefiles are generated or include .mk dynamically)
         return f'make -C "{likely_dir}" -j'
-
     return None
 
-# -------- The rest of the probers (unchanged) --------
+# -------- Bazel --------
+def probe_bazel(files: List[Tuple[str, Path]]) -> Optional[str]:
+    workspaces = [p for (n, p) in files if n in ("workspace", "workspace.bazel", "module.bazel")]
+    builds     = [p for (n, p) in files if n in ("build", "build.bazel")]
+    root = prefer_shortest(workspaces) or prefer_shortest(builds)
+    if not root:
+        return None
+    d = root.parent
+    # Prefer bazelisk if available in workflow (we install via action); else bazel
+    return f'cd "{d}" && (command -v bazelisk >/dev/null 2>&1 && bazelisk build //... || bazel build //...)'
+
+# -------- SCons --------
+def probe_scons(files: List[Tuple[str, Path]]) -> Optional[str]:
+    sconstructs = [p for (n, p) in files if n == "sconstruct"]
+    sconss      = [p for (n, p) in files if n == "sconscript"]
+    chosen = prefer_shortest(sconstructs) or prefer_shortest(sconss)
+    if not chosen:
+        return None
+    d = chosen.parent
+    return f'scons -C "{d}" -j'
+
+# -------- Ninja (direct) --------
+def probe_ninja(files: List[Tuple[str, Path]]) -> Optional[str]:
+    ninjas = [p for (n, p) in files if n == "build.ninja"]
+    chosen = prefer_shortest(ninjas)
+    if not chosen:
+        return None
+    return f'ninja -C "{chosen.parent}"'
+
+# -------- Android helpers --------
 def is_app_module(dirp: Path) -> bool:
     for fn in ("build.gradle", "build.gradle.kts"):
         f = dirp / fn
@@ -120,6 +141,7 @@ def run_tasks_list(gradlew: Path) -> str:
 def task_exists(tasks_out: str, name: str) -> bool:
     return re.search(rf"(^|\s){re.escape(name)}(\s|$)", tasks_out) is not None
 
+# -------- Android --------
 def probe_android(files: List[Tuple[str, Path]]) -> Optional[str]:
     gradlews = [p for (n, p) in files if n == "gradlew"]
     if not gradlews and (ROOT / "gradlew").exists():
@@ -156,6 +178,7 @@ def probe_android(files: List[Tuple[str, Path]]) -> Optional[str]:
                 return f"cd {base} && ./gradlew :{guess}:{t} --stacktrace"
     return f"cd {base} && ./gradlew assembleDebug --stacktrace"
 
+# -------- CMake --------
 def probe_cmake(files: List[Tuple[str, Path]]) -> Optional[str]:
     cmakes = [p for (n, p) in files if n == "cmakelists.txt"]
     first = prefer_shortest(cmakes)
@@ -163,6 +186,7 @@ def probe_cmake(files: List[Tuple[str, Path]]) -> Optional[str]:
     outdir = f'build/{str(first.parent).replace("/", "_")}'
     return f'cmake -S "{first.parent}" -B "{outdir}" && cmake --build "{outdir}" -j'
 
+# -------- Node --------
 def probe_node(files: List[Tuple[str, Path]]) -> Optional[str]:
     pkgs = [p for (n, p) in files if n == "package.json"]
     if not pkgs: return None
@@ -174,6 +198,7 @@ def probe_node(files: List[Tuple[str, Path]]) -> Optional[str]:
     chosen = prefer_shortest(with_build) or prefer_shortest(pkgs)
     return f'cd "{chosen.parent}" && npm ci && npm run build --if-present'
 
+# -------- Python --------
 def probe_python(files: List[Tuple[str, Path]]) -> Optional[str]:
     pyprojects = [p for (n, p) in files if n == "pyproject.toml"]
     setups     = [p for (n, p) in files if n == "setup.py"]
@@ -182,12 +207,14 @@ def probe_python(files: List[Tuple[str, Path]]) -> Optional[str]:
     d = chosen.parent
     return f'cd "{d}" && pip install -e . && (pytest || python -m pytest || true)'
 
+# -------- Rust --------
 def probe_rust(files: List[Tuple[str, Path]]) -> Optional[str]:
     cargos = [p for (n, p) in files if n == "cargo.toml"]
     chosen = prefer_shortest(cargos)
     if not chosen: return None
     return f'cd "{chosen.parent}" && cargo build --locked --all-targets --verbose'
 
+# -------- .NET --------
 def probe_dotnet(files: List[Tuple[str, Path]]) -> Optional[str]:
     slns = [p for (n, p) in files if str(p).lower().endswith(".sln")]
     if slns:
@@ -199,27 +226,34 @@ def probe_dotnet(files: List[Tuple[str, Path]]) -> Optional[str]:
         return f'dotnet restore "{chosen}" && dotnet build "{chosen}" -c Release'
     return None
 
+# -------- Maven --------
 def probe_maven(files: List[Tuple[str, Path]]) -> Optional[str]:
     poms = [p for (n, p) in files if n == "pom.xml"]
     chosen = prefer_shortest(poms)
     if not chosen: return None
     return f'mvn -B package --file "{chosen}"'
 
+# -------- Flutter --------
 def probe_flutter(files: List[Tuple[str, Path]]) -> Optional[str]:
     pubs = [p for (n, p) in files if n == "pubspec.yaml"]
     chosen = prefer_shortest(pubs)
     if not chosen: return None
     return f'cd "{chosen.parent}" && flutter build apk --debug'
 
+# -------- Go --------
 def probe_go(files: List[Tuple[str, Path]]) -> Optional[str]:
     mods = [p for (n, p) in files if n == "go.mod"]
     chosen = prefer_shortest(mods)
     if not chosen: return None
     return f'cd "{chosen.parent}" && go build ./...'
 
+# -------- Unknown --------
+def probe_unknown(_files: List[Tuple[str, Path]]) -> str:
+    return "echo 'No build system detected' && exit 1"
+
 def main():
     if len(sys.argv) < 3 or sys.argv[1] != "--type":
-        print("Usage: AirysDark-AI_probe.py --type <android|cmake|linux|node|python|rust|dotnet|maven|flutter|go|unknown>")
+        print("Usage: AirysDark-AI_probe.py --type <android|cmake|linux|node|python|rust|dotnet|maven|flutter|go|bazel|scons|ninja|unknown>")
         return 2
     ptype = sys.argv[2].strip().lower()
     files = scan_all_files()
@@ -235,17 +269,27 @@ def main():
         "maven":   probe_maven,
         "flutter": probe_flutter,
         "go":      probe_go,
-        "unknown": lambda _f: "echo 'No build system detected' && exit 1",
+        "bazel":   probe_bazel,
+        "scons":   probe_scons,
+        "ninja":   probe_ninja,
+        "unknown": probe_unknown,
     }
 
-    func = dispatch.get(ptype)
-    cmd = func(files) if func else "echo 'Unknown type' && exit 1"
+    func = dispatch.get(ptype, probe_unknown)
+    cmd = func(files)
 
     if not cmd:
+        # Friendly fallbacks
         if ptype == "linux":
             cmd = "echo 'No Makefile / meson.build found (only .mk includes?)' && exit 1"
         elif ptype == "cmake":
             cmd = "echo 'No CMakeLists.txt found' && exit 1"
+        elif ptype == "bazel":
+            cmd = "echo 'No Bazel WORKSPACE / BUILD found' && exit 1"
+        elif ptype == "scons":
+            cmd = "echo 'No SConstruct / SConscript found' && exit 1"
+        elif ptype == "ninja":
+            cmd = "echo 'No build.ninja found' && exit 1"
         else:
             cmd = "echo 'No build system detected' && exit 1"
 
