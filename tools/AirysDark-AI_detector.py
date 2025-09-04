@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # AirysDark-AI_detector.py
 #
-# Detects build types by scanning the entire repo (all subfolders / files).
+# Detects build types by scanning the entire repo (all subfolders/files).
 # Adds:
 #   - Folder-name hints (linux / android / windows)
 #   - CMakeLists.txt content inspection (flags linux when desktop-ish)
@@ -14,10 +14,9 @@
 #   - Runs AirysDark-AI_probe.py to compute BUILD_CMD
 #   - Writes the final AI workflow .github/workflows/AirysDark-AI_<type>.yml (heredoc)
 #   - Uses peter-evans/create-pull-request with secrets.BOT_TOKEN
-#   - (NEW) Sets checkout persist-credentials: false and pins git remote to BOT_TOKEN
+#   - (HARDENED) checkout persist-credentials: false + pin git remote to BOT_TOKEN to avoid prune/auth errors
 #
-# Types supported: android, cmake, linux, node, python, rust, dotnet, maven, flutter, go,
-#                  bazel, scons, ninja, unknown
+# Types: android, cmake, linux, node, python, rust, dotnet, maven, flutter, go, bazel, scons, ninja, unknown
 
 import os
 import pathlib
@@ -105,18 +104,19 @@ def detect_types():
     if ("makefile" in fnames) or ("gnumakefile" in fnames) or ("meson.build" in fnames) or any(r.endswith(".mk") for r in rels):
         if "linux" not in types: types.append("linux")
 
-    if "package.json" in fnames: types.append("node")
-    if "pyproject.toml" in fnames or "setup.py" in fnames: types.append("python")
-    if "cargo.toml" in fnames: types.append("rust")
-    if any(r.endswith(".sln") or r.endswith(".csproj") or r.endswith(".fsproj") for r in rels): types.append("dotnet")
-    if "pom.xml" in fnames: types.append("maven")
-    if "pubspec.yaml" in fnames: types.append("flutter")
-    if "go.mod" in fnames: types.append("go")
+    if "package.json" in fnames and "node" not in types: types.append("node")
+    if ("pyproject.toml" in fnames or "setup.py" in fnames) and "python" not in types: types.append("python")
+    if "cargo.toml" in fnames and "rust" not in types: types.append("rust")
+    if any(r.endswith(".sln") or r.endswith(".csproj") or r.endswith(".fsproj") for r in rels) and "dotnet" not in types: types.append("dotnet")
+    if "pom.xml" in fnames and "maven" not in types: types.append("maven")
+    if "pubspec.yaml" in fnames and "flutter" not in types: types.append("flutter")
+    if "go.mod" in fnames and "go" not in types: types.append("go")
     if any(n in ("workspace","workspace.bazel","module.bazel") for n in fnames) or \
        any(os.path.basename(r) in ("build","build.bazel") for r in rels):
-        types.append("bazel")
-    if "sconstruct" in fnames or "sconscript" in fnames: types.append("scons")
-    if "build.ninja" in fnames: types.append("ninja")
+        if "bazel" not in types: types.append("bazel")
+    if "sconstruct" in fnames or "sconscript" in fnames:
+        if "scons" not in types: types.append("scons")
+    if "build.ninja" in fnames and "ninja" not in types: types.append("ninja")
 
     if not types: types.append("unknown")
 
@@ -204,9 +204,35 @@ def setup_steps_inline(ptype: str) -> str:
     # cmake/python/unknown: only setup-python is needed in the template
     return ""
 
+# ---------- shared pin-remote block (YAML) ----------
+PIN_REMOTE_YAML = textwrap.dedent("""\
+      - name: Pin git remote with token
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          REPO_SLUG: ${{ github.repository }}
+        run: |
+          set -euxo pipefail
+          # remove any leftover Basic auth header from checkout
+          git config --local --name-only --get-regexp '^http\\.https://github\\.com/\\.extraheader$' >/dev/null 2>&1 && \
+            git config --local --unset-all http.https://github.com/.extraheader || true
+
+          # ensure this workspace is safe for git
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+          # force origin to use the PAT
+          git remote set-url origin "https://x-access-token:${BOT_TOKEN}@github.com/${REPO_SLUG}.git"
+
+          # rewrite any future https://github.com/... to use the PAT automatically
+          git config --global url."https://x-access-token:${BOT_TOKEN}@github.com/".insteadOf "https://github.com/"
+
+          # verify
+          git remote -v
+""")
+
 # ---------- PROBE workflow (generic) ----------
 def write_probe_workflow_for_type(ptype: str):
     setup_inline = setup_steps_inline(ptype)
+
     tmpl = r"""
 name: AirysDark-AI — Probe __PTYPE_CAP__
 
@@ -227,16 +253,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0, persist-credentials: false }
-
-      - name: Pin git remote with token
-        env:
-          BOT_TOKEN: __GHA__ secrets.BOT_TOKEN __GHA_END__
-          REPO_SLUG: __GHA__ github.repository __GHA_END__
-        run: |
-          git remote set-url origin "https://x-access-token:${BOT_TOKEN}@github.com/${REPO_SLUG}.git"
-          git config --global url."https://x-access-token:${BOT_TOKEN}@github.com/".insteadOf "https://github.com/"
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
+__PIN_REMOTE__
       - uses: actions/setup-python@v5
         with: { python-version: "3.11" }
       - run: pip install requests
@@ -287,16 +304,7 @@ __SETUP_INLINE__
               steps:
                 - uses: actions/checkout@v4
                   with: { fetch-depth: 0, persist-credentials: false }
-
-                - name: Pin git remote with token
-                  env:
-                    BOT_TOKEN: __GHA__ secrets.BOT_TOKEN __GHA_END__
-                    REPO_SLUG: __GHA__ github.repository __GHA_END__
-                  run: |
-                    git remote set-url origin "https://x-access-token:${BOT_TOKEN}@github.com/${REPO_SLUG}.git"
-                    git config --global url."https://x-access-token:${BOT_TOKEN}@github.com/".insteadOf "https://github.com/"
-                    git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
+__PIN_REMOTE__
                 - uses: actions/setup-python@v5
                   with: { python-version: "3.11" }
                 - run: pip install requests
@@ -421,6 +429,7 @@ __SETUP_INLINE__
 
     yaml = (tmpl
             .replace("__SETUP_INLINE__", setup_block.rstrip("\n"))
+            .replace("__PIN_REMOTE__", textwrap.indent(PIN_REMOTE_YAML.rstrip("\n"), "      "))
             .replace("__PTYPE__", ptype)
             .replace("__PTYPE_CAP__", ptype.capitalize())
             .replace("__GHA__", "${{")
@@ -432,6 +441,7 @@ __SETUP_INLINE__
 # ---------- Android-specific PROBE writer ----------
 def write_probe_workflow_for_android():
     setup_inline = setup_steps_inline("android")
+
     tmpl = r"""
 name: AirysDark-AI — Probe Android
 
@@ -452,16 +462,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0, persist-credentials: false }
-
-      - name: Pin git remote with token
-        env:
-          BOT_TOKEN: __GHA__ secrets.BOT_TOKEN __GHA_END__
-          REPO_SLUG: __GHA__ github.repository __GHA_END__
-        run: |
-          git remote set-url origin "https://x-access-token:${BOT_TOKEN}@github.com/${REPO_SLUG}.git"
-          git config --global url."https://x-access-token:${BOT_TOKEN}@github.com/".insteadOf "https://github.com/"
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
+__PIN_REMOTE__
       - uses: actions/setup-python@v5
         with: { python-version: "3.11" }
       - run: pip install requests
@@ -512,16 +513,7 @@ __SETUP_INLINE__
               steps:
                 - uses: actions/checkout@v4
                   with: { fetch-depth: 0, persist-credentials: false }
-
-                - name: Pin git remote with token
-                  env:
-                    BOT_TOKEN: __GHA__ secrets.BOT_TOKEN __GHA_END__
-                    REPO_SLUG: __GHA__ github.repository __GHA_END__
-                  run: |
-                    git remote set-url origin "https://x-access-token:${BOT_TOKEN}@github.com/${REPO_SLUG}.git"
-                    git config --global url."https://x-access-token:${BOT_TOKEN}@github.com/".insteadOf "https://github.com/"
-                    git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
+__PIN_REMOTE__
                 - uses: actions/setup-python@v5
                   with: { python-version: "3.11" }
                 - run: pip install requests
@@ -655,6 +647,7 @@ __SETUP_INLINE__
 
     yaml = (tmpl
             .replace("__SETUP_INLINE__", setup_block.rstrip("\n"))
+            .replace("__PIN_REMOTE__", textwrap.indent(PIN_REMOTE_YAML.rstrip("\n"), "      "))
             .replace("__GHA__", "${{")
             .replace("__GHA_END__", "}}"))
 
