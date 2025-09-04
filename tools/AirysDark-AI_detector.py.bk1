@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
 # AirysDark-AI_detector.py
-# Detects project type(s) and generates ready-to-run workflows:
-#   .github/workflows/AirysDark-AI_<type>.yml
-#
-# Each generated workflow:
-# - triggers on push / PR / manual dispatch (Run button) and is reusable (workflow_call)
-# - installs language/toolchain where needed
-# - ensures tools/ has the AI scripts (fetch from AirysDark-AI org if missing)
-# - runs the build, captures build.log
-# - if it fails, runs the AI autobuilder (OpenAI → llama.cpp fallback)
-# - opens a PR with changes using a PAT (secrets.BOT_TOKEN) with repo+workflow scopes
+# - Recursive detection for all project types (whole repo)
+# - Generates one workflow per detected type:
+#     .github/workflows/AirysDark-AI_<type>.yml
+# - Uses a Probe step (AirysDark-AI_probe.py) to find the correct build command
+# - Build → AI auto-fix (OpenAI → llama.cpp in runner temp) → PR → Artifacts
 
 import os
 import pathlib
@@ -22,6 +17,7 @@ WF.mkdir(parents=True, exist_ok=True)
 
 # ---------- Helpers ----------
 def exists_any(patterns):
+    """Return True if any glob pattern matches anywhere in repo (recursive)."""
     for pat in patterns:
         if list(ROOT.glob(pat)):
             return True
@@ -30,49 +26,46 @@ def exists_any(patterns):
 def detect_types():
     types = []
     # android / gradle
-    if (ROOT / "gradlew").exists() or exists_any(["**/gradlew", "**/build.gradle*", "**/settings.gradle*"]):
+    if exists_any(["**/gradlew", "**/build.gradle*", "**/settings.gradle*"]):
         types.append("android")
     # cmake
-    if (ROOT / "CMakeLists.txt").exists() or exists_any(["**/CMakeLists.txt"]):
+    if exists_any(["**/CMakeLists.txt"]):
         types.append("cmake")
     # node
-    if (ROOT / "package.json").exists():
+    if exists_any(["**/package.json"]):
         types.append("node")
     # python
-    if (ROOT / "setup.py").exists() or (ROOT / "pyproject.toml").exists():
+    if exists_any(["**/setup.py", "**/pyproject.toml"]):
         types.append("python")
     # rust
-    if (ROOT / "Cargo.toml").exists():
+    if exists_any(["**/Cargo.toml"]):
         types.append("rust")
     # dotnet
-    if exists_any(["*.sln", "**/*.csproj", "**/*.fsproj"]):
+    if exists_any(["**/*.sln", "**/*.csproj", "**/*.fsproj"]):
         types.append("dotnet")
     # maven
-    if (ROOT / "pom.xml").exists():
+    if exists_any(["**/pom.xml"]):
         types.append("maven")
     # flutter
-    if (ROOT / "pubspec.yaml").exists():
+    if exists_any(["**/pubspec.yaml"]):
         types.append("flutter")
     # go
-    if (ROOT / "go.mod").exists():
+    if exists_any(["**/go.mod"]):
         types.append("go")
+    # linux: Makefile / meson.build / *.mk / or linux dir present
+    if exists_any(["**/Makefile", "**/*.mk", "**/meson.build", "linux", "linux/**"]):
+        types.append("linux")
+
     if not types:
         types.append("unknown")
-    return types
 
-# ---------- Build commands ----------
-BUILD_CMDS = {
-    "android": "./gradlew assembleDebug --stacktrace",
-    "cmake":   "cmake -S . -B build && cmake --build build -j",
-    "node":    "npm ci && npm run build --if-present",
-    "python":  "pip install -e . && pytest || python -m pytest",
-    "rust":    "cargo build --locked --all-targets --verbose",
-    "dotnet":  "dotnet restore && dotnet build -c Release",
-    "maven":   "mvn -B package --file pom.xml",
-    "flutter": "flutter build apk --debug",
-    "go":      "go build ./...",
-    "unknown": "echo 'No build system detected' && exit 1",
-}
+    # de-dupe while preserving order
+    seen, deduped = set(), []
+    for t in types:
+        if t not in seen:
+            seen.add(t)
+            deduped.append(t)
+    return deduped
 
 # ---------- Type-specific setup ----------
 def setup_steps(ptype: str) -> str:
@@ -122,13 +115,19 @@ def setup_steps(ptype: str) -> str:
             with: { go-version: "1.22" }
           - run: go version
         """)
-    # cmake/python/unknown don't need extra setup beyond setup-python
+    if ptype == "linux":
+        return textwrap.dedent("""
+          - name: Install Meson & Ninja (Linux only)
+            run: |
+              sudo apt-get update
+              sudo apt-get install -y meson ninja-build pkg-config
+        """)
+    # cmake / python / unknown: no extra beyond setup-python
     return ""
 
-# ---------- YAML write (UPDATED) ----------
-def write_workflow(ptype: str, cmd: str):
+# ---------- Workflow writer (Probe → Build → AI → PR → Artifacts) ----------
+def write_workflow(ptype: str):
     setup = setup_steps(ptype)
-    # Expanded triggers include workflow_dispatch (Run button) and workflow_call (reusable)
     yaml = f"""
     name: AirysDark-AI — {ptype.capitalize()} (generated)
 
@@ -146,6 +145,7 @@ def write_workflow(ptype: str, cmd: str):
           pull-requests: write
         steps:
           - uses: actions/checkout@v4
+            with: {{ fetch-depth: 0 }}
 
           - uses: actions/setup-python@v5
             with: {{ python-version: "3.11" }}
@@ -160,24 +160,48 @@ def write_workflow(ptype: str, cmd: str):
               BASE_URL="https://raw.githubusercontent.com/AirysDark-AI/AirysDark-AI_builder/main/tools"
               [ -f tools/AirysDark-AI_detector.py ] || curl -fL "$BASE_URL/AirysDark-AI_detector.py" -o tools/AirysDark-AI_detector.py
               [ -f tools/AirysDark-AI_builder.py ]  || curl -fL "$BASE_URL/AirysDark-AI_builder.py"  -o tools/AirysDark-AI_builder.py
+              [ -f tools/AirysDark-AI_probe.py ]    || curl -fL "$BASE_URL/AirysDark-AI_probe.py"    -o tools/AirysDark-AI_probe.py
               ls -la tools
+
+          - name: Probe build command
+            id: probe
+            shell: bash
+            run: |
+              set -euxo pipefail
+              python3 tools/AirysDark-AI_probe.py --type "{ptype}" | tee /tmp/probe.out
+              CMD=$(grep -E '^BUILD_CMD=' /tmp/probe.out | sed 's/^BUILD_CMD=//')
+              echo "BUILD_CMD=$CMD" >> "$GITHUB_OUTPUT"
 
           - name: Build (capture)
             id: build
             shell: bash
             run: |
               set -euxo pipefail
-              CMD="{cmd}"
+              CMD="${{{{ steps.probe.outputs.BUILD_CMD }}}}"
               echo "BUILD_CMD=$CMD" >> "$GITHUB_OUTPUT"
               set +e; bash -lc "$CMD" | tee build.log; EXIT=$?; set -e
               echo "EXIT_CODE=$EXIT" >> "$GITHUB_OUTPUT"
-              [ -f build.log ] || echo "(no build output captured)" > build.log
+              [ -s build.log ] || echo "(no build output captured)" > build.log
               exit 0
             continue-on-error: true
 
+          - name: Upload build log
+            if: always()
+            uses: actions/upload-artifact@v4
+            with:
+              name: {ptype}-build-log
+              path: build.log
+              if-no-files-found: warn
+              retention-days: 7
+
           # --- AI auto-fix block (OpenAI → llama fallback) ---
-          - name: Build llama.cpp (CMake, no CURL)
+          - name: Build llama.cpp (CMake, no CURL, in temp)
+            if: always() && steps.build.outputs.EXIT_CODE != '0'
             run: |
+              set -euxo pipefail
+              TMP="${{{{ runner.temp }}}}"
+              cd "$TMP"
+              rm -rf llama.cpp
               git clone --depth=1 https://github.com/ggml-org/llama.cpp
               cd llama.cpp
               cmake -S . -B build -D CMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF
@@ -185,6 +209,7 @@ def write_workflow(ptype: str, cmd: str):
               echo "LLAMA_CPP_BIN=$PWD/build/bin/llama-cli" >> $GITHUB_ENV
 
           - name: Fetch GGUF model (TinyLlama)
+            if: always() && steps.build.outputs.EXIT_CODE != '0'
             run: |
               mkdir -p models
               curl -L -o models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \\
@@ -199,17 +224,51 @@ def write_workflow(ptype: str, cmd: str):
               OPENAI_MODEL: ${{{{ vars.OPENAI_MODEL || 'gpt-4o-mini' }}}}
               MODEL_PATH: models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
               AI_BUILDER_ATTEMPTS: "3"
-              BUILD_CMD: ${{{{ steps.build.outputs.BUILD_CMD }}}}
+              BUILD_CMD: ${{{{ steps.probe.outputs.BUILD_CMD }}}}
             run: python3 tools/AirysDark-AI_builder.py || true
 
-          # --- Only open PR if changes exist (use PAT with workflow scope) ---
+          - name: Upload AI patch (if any)
+            if: always()
+            uses: actions/upload-artifact@v4
+            with:
+              name: {ptype}-ai-patch
+              path: .pre_ai_fix.patch
+              if-no-files-found: ignore
+              retention-days: 7
+
+          - name: Upload build artifacts
+            if: always()
+            uses: actions/upload-artifact@v4
+            with:
+              name: {ptype}-artifacts
+              if-no-files-found: ignore
+              retention-days: 7
+              path: |
+                build/**
+                out/**
+                dist/**
+                target/**
+                **/build/**
+                **/out/**
+                **/dist/**
+                **/target/**
+                **/*.so
+                **/*.a
+                **/*.dll
+                **/*.dylib
+                **/*.exe
+                **/*.bin
+                **/outputs/**/*.apk
+                **/outputs/**/*.aab
+                **/*.whl
+
           - name: Check for changes
             id: diff
             run: |
               git add -A
               if git diff --cached --quiet; then
                 echo "changed=false" >> "$GITHUB_OUTPUT"
-              else
+              else:
                 echo "changed=true" >> "$GITHUB_OUTPUT"
               fi
 
@@ -223,6 +282,7 @@ def write_workflow(ptype: str, cmd: str):
               title: "AirysDark-AI: automated build fix"
               body: |
                 This PR was opened automatically by a generated workflow after a failed build.
+                - Probed command: ${{{{ steps.probe.outputs.BUILD_CMD }}}}}
                 - Captured the failing build log
                 - Proposed a minimal fix via AI
                 - Committed the changes for review
@@ -236,7 +296,7 @@ def write_workflow(ptype: str, cmd: str):
 def main():
     types = detect_types()
     for t in types:
-        write_workflow(t, BUILD_CMDS[t])
+        write_workflow(t)
     print(f"Done. Generated {len(types)} workflow(s) in {WF}")
 
 if __name__ == "__main__":
