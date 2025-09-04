@@ -282,7 +282,7 @@ def write_workflow(ptype: str):
               title: "AirysDark-AI: automated build fix"
               body: |
                 This PR was opened automatically by a generated workflow after a failed build.
-                - Probed command: ${{{{ steps.probe.outputs.BUILD_CMD }}}}}
+                - Probed command: ${{{{ steps.probe.outputs.BUILD_CMD }}}}
                 - Captured the failing build log
                 - Proposed a minimal fix via AI
                 - Committed the changes for review
