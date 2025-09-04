@@ -3,9 +3,11 @@
 # - Recursive detection for all project types (whole repo)
 # - Generates one workflow per detected type:
 #     .github/workflows/AirysDark-AI_<type>.yml
-# - Linux type supports Makefile and Meson/Ninja automatically
-# - Uploads build.log, AI patch, and common build outputs as artifacts
-# - Uses PAT (secrets.BOT_TOKEN) for PR creation with workflow file changes
+# - Android: robust multi-module detection & build task discovery
+# - Linux: Makefile or Meson/Ninja
+# - CMake: top-level or first found subdir
+# - Uploads build.log, AI patch, and common outputs as artifacts
+# - Uses PAT (secrets.BOT_TOKEN) for PR creation (needed to PR workflow files)
 
 import os
 import pathlib
@@ -53,7 +55,7 @@ def detect_types():
     # go
     if exists_any(["**/go.mod"]):
         types.append("go")
-    # linux: treat Makefiles, meson.build, *.mk, or a linux/ dir as a linux build
+    # linux: Makefile, meson.build, *.mk, or a linux/ dir
     if exists_any(["**/Makefile", "**/*.mk", "**/meson.build", "linux", "linux/**"]):
         types.append("linux")
 
@@ -70,26 +72,59 @@ def detect_types():
 
 # ---------- Build commands (smart subdir resolution) ----------
 BUILD_CMDS = {
-    # Android: try root gradlew; else find first **/gradlew and run there;
-    # also try -p <dir> form to point Gradle at the module folder.
+    # ANDROID:
+    # - Try root gradlew; else try every gradlew in the repo
+    # - Discover modules via settings.gradle[.kts] include(":app", ":mobile", ...)
+    # - Discover app modules via com.android.application plugin in build.gradle[.kts]
+    # - Try assembleDebug / :module:assembleDebug / assembleRelease / :module:assembleRelease / build
     "android": (
         "bash -lc '"
-        "set -e; "
+        "set -euo pipefail; "
+        "run_gradle() { "
+        "  g=$1; d=$(dirname \"$g\"); chmod +x \"$g\" || true; "
+        "  echo \"[Android] using gradle at: $d\"; "
+        "  cd \"$d\"; "
+        "  # collect candidate modules from settings.gradle/settings.gradle.kts includes "
+        "  mods=\"\"; "
+        "  for s in settings.gradle settings.gradle.kts; do "
+        "    if [ -f \"$s\" ]; then "
+        "      ms=$(grep -E \"^[[:space:]]*include\\(\" \"$s\" | sed -E \"s/.*include\\((.*)\\).*/\\1/\" | tr -d \"\\\"'[:space:]\" | tr \",\" \"\\n\" | sed \"s/^://\"); "
+        "      if [ -n \"$ms\" ]; then mods=\"$mods $ms\"; fi; "
+        "    fi; "
+        "  done; "
+        "  # add modules that apply the Android application plugin "
+        "  ms_app=$(git ls-files | grep -E \"(^|/)(build.gradle|build.gradle.kts)$\" | while read -r f; do "
+        "    if grep -qE \"com\\.android\\.application\" \"$f\"; then "
+        "      echo \"${f%/*}\" | sed -E \"s#^\\./?##; s#/#:#g\"; "
+        "    fi; "
+        "  done | sed \"s#^#:##\"); "
+        "  mods=\"$mods $ms_app\"; "
+        "  # common guesses "
+        "  mods=\"$mods app mobile android\"; "
+        "  # normalize unique module list "
+        "  umods=\"\"; for m in $mods; do [ -n \"$m\" ] && case \" $umods \" in *\" $m \"*) ;; *) umods=\"$umods $m\";; esac; done; "
+        "  echo \"[Android] candidate modules:$umods\"; "
+        "  # try task permutations "
+        "  set +e; "
+        "  ./gradlew assembleDebug --stacktrace && exit 0; "
+        "  for m in $umods; do ./gradlew :$m:assembleDebug --stacktrace && exit 0; done; "
+        "  ./gradlew assembleRelease --stacktrace && exit 0; "
+        "  for m in $umods; do ./gradlew :$m:assembleRelease --stacktrace && exit 0; done; "
+        "  ./gradlew build --stacktrace && exit 0; "
+        "  exit 1; "
+        "}; "
         "if [ -x ./gradlew ]; then "
-        "  chmod +x ./gradlew || true; "
-        "  ./gradlew assembleDebug --stacktrace; "
+        "  run_gradle ./gradlew; "
         "else "
-        "  g=$(git ls-files | grep -E \"(^|/)gradlew$\" | head -n1 || true); "
-        "  if [ -n \"$g\" ]; then "
-        "    d=$(dirname \"$g\"); chmod +x \"$g\" || true; "
-        "    (cd \"$d\" && ./gradlew assembleDebug --stacktrace) || ./gradlew -p \"$d\" assembleDebug --stacktrace; "
-        "  else "
-        "    echo \"No gradlew found\"; exit 1; "
-        "  fi; "
+        "  ok=; "
+        "  for g in $(git ls-files | grep -E \"(^|/)gradlew$\" | sort); do "
+        "    run_gradle \"$g\" && ok=1 && break || true; "
+        "  done; "
+        "  [ -n \"$ok\" ] || { echo \"No working gradlew found\"; exit 1; }; "
         "fi'"
     ),
 
-    # CMake: prefer top-level CMakeLists; else find first one and build there with a dedicated out dir.
+    # CMAKE: top-level or first subdir with CMakeLists.txt
     "cmake": (
         "bash -lc '"
         "set -e; "
@@ -105,7 +140,7 @@ BUILD_CMDS = {
         "fi'"
     ),
 
-    # Node: prefer root; else iterate all package.json and build first that succeeds.
+    # NODE: root or first subdir with package.json
     "node": (
         "bash -lc '"
         "set -e; "
@@ -120,7 +155,7 @@ BUILD_CMDS = {
         "fi'"
     ),
 
-    # Python: prefer root; else try each pyproject/setup.
+    # PYTHON: root or any subdir with pyproject/setup
     "python": (
         "bash -lc '"
         "set -e; "
@@ -141,7 +176,7 @@ BUILD_CMDS = {
     "flutter":"flutter build apk --debug",
     "go":     "go build ./...",
 
-    # Linux: Makefile (root or first found) → make; else Meson/Ninja (root or first found)
+    # LINUX: Makefile (root or first found) → make; else Meson/Ninja (root or first found)
     "linux": (
         "bash -lc '"
         "set -e; "
@@ -216,7 +251,6 @@ def setup_steps(ptype: str) -> str:
           - run: go version
         """)
     if ptype == "linux":
-        # ensure meson/ninja are available when meson.build is present
         return textwrap.dedent("""
           - name: Install Meson & Ninja (Linux only)
             run: |
