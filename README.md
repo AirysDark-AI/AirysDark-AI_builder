@@ -63,15 +63,16 @@ jobs:
       - name: Create PR with generated workflows
         uses: peter-evans/create-pull-request@v6
         with:
-          branch: ai/airysdark-ai-detector
-          title: "AirysDark-AI_Detector"
-          commit-message: "chore: generate AirysDark-AI workflows + script"
+          branch: ai/airysdark-ai-bootstrap
+          title: "AirysDark-AI: bootstrap (multi-purpose)"
+          commit-message: "chore: generate AirysDark-AI workflows + script (multi-purpose)"
           body: |
             This PR was created by the bootstrap workflow.
             - Detects project type (android / cmake / node / python / rust / dotnet / maven / flutter / go / unknown)
             - Generates a matching CI workflow with build capture
             - Adds AirysDark-AirysDark-AI (OpenAI ? llama fallback) and TinyLlama GGUF fetch
           labels: automation, ci
+
 
 ```
 
