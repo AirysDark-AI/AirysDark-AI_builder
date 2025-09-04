@@ -66,17 +66,6 @@ jobs:
           labels: automation, ci
 ```
 
-✅ What it does:
-- Runs the **detector** (`tools/AirysDark-AI_detector.py`)
-- Generates `.github/workflows/AirysDark-AI_<type>.yml` based on your project
-- Opens a PR with the generated workflows + builder script
-
-🔑 Required repo **secrets**:
-- `BOT_TOKEN` — GitHub PAT (with **Contents: write** and **Pull requests: write**)
-- *(optional)* `OPENAI_API_KEY` — to use OpenAI before the llama.cpp fallback
-
-👉 Run this from your repo’s **Actions** tab → **AirysDark-AI_detector**.
-
 ---
 
 ## 2) Reusable autobuilder workflow (use from *other* repos)
@@ -105,45 +94,109 @@ jobs:
       # build_cmd: "npm ci && npm run build --if-present"
 ```
 
-### 🔗 How to “point the builder to your repo”
-- The `uses:` line tells GitHub to **call the universal workflow** from your published builder repo.  
-Examples:
-```yaml
-uses: AirysDark/AirysDark-AI_Builder/.github/workflows/AirysDark-AI_universal.yml@main
-uses: AirysDark/AirysDark-AI_Builder/.github/workflows/AirysDark-AI_universal.yml@v1
-uses: AirysDark/AirysDark-AI_Builder/.github/workflows/AirysDark-AI_universal.yml@<commit-sha>
-```
-
-- The `project_dir` input tells the builder **where in your repo** the project lives:
-  - Root: `project_dir: "."`
-  - Subfolder: `project_dir: "android"` or `project_dir: "backend"`
-
-- To override auto-detection, set `build_cmd` explicitly:
-```yaml
-with:
-  project_dir: "backend"
-  build_cmd: "pip install -e . && pytest"
-```
-
-🔑 Secrets needed in the calling repo:
-- `BOT_TOKEN` — PAT with **Contents: write**, **Pull requests: write**
-- *(optional)* `OPENAI_API_KEY`
-
 ---
 
-## 3) Optional: Using the generated per-type workflows
-If you ran the detector, it will generate files like:
-- `.github/workflows/AirysDark-AI_python.yml`
-- `.github/workflows/AirysDark-AI_cmake.yml`
-- `.github/workflows/AirysDark-AI_android.yml`
+## 3) Full code: `AirysDark-AI_universal.yml`
 
-You can run those directly from Actions too.  
-They already trigger `tools/AirysDark-AI_builder.py` on failures and open PRs with the proposed patches.
+This is the reusable workflow that other repos call with `uses:`:
+
+```yaml
+name: AirysDark-AI — Universal (reusable)
+
+on:
+  workflow_dispatch:
+  push:
+  pull_request:
+  workflow_call:
+    inputs:
+      project_dir:
+        description: "Subdirectory of the project to build ('.' by default)"
+        required: false
+        type: string
+        default: "."
+      build_cmd:
+        description: "Override build command (optional)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  universal:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install requests
+
+      - name: Detect & choose build command
+        id: buildcmd
+        run: |
+          set -euo pipefail
+          cd "${{ inputs.project_dir }}"
+          if [ -n "${{ inputs.build_cmd }}" ]; then
+            CMD="${{ inputs.build_cmd }}"
+          else
+            if [ -f "gradlew" ] || ls **/build.gradle* **/settings.gradle* >/dev/null 2>&1; then
+              chmod +x gradlew || true
+              CMD="./gradlew assembleDebug --stacktrace"
+            elif [ -f "CMakeLists.txt" ] || ls **/CMakeLists.txt >/dev/null 2>&1; then
+              CMD="cmake -S . -B build && cmake --build build -j"
+            elif [ -f "package.json" ]; then
+              CMD="npm ci && npm run build --if-present"
+            elif [ -f "pyproject.toml" ] || [ -f "setup.py" ]; then
+              CMD="pip install -e . && pytest || python -m pytest"
+            elif [ -f "Cargo.toml" ]; then
+              CMD="cargo build --locked --all-targets --verbose"
+            elif ls *.sln **/*.csproj **/*.fsproj >/dev/null 2>&1; then
+              CMD="dotnet restore && dotnet build -c Release"
+            elif [ -f "pom.xml" ]; then
+              CMD="mvn -B package --file pom.xml"
+            elif [ -f "pubspec.yaml" ]; then
+              CMD="flutter build apk --debug"
+            elif [ -f "go.mod" ]; then
+              CMD="go build ./..."
+            else
+              CMD="echo 'No build system detected' && exit 1"
+            fi
+          fi
+          echo "BUILD_CMD=cd $PWD && $CMD" >> "$GITHUB_OUTPUT"
+          echo "Using: $CMD"
+
+      - name: Build (capture)
+        id: build
+        run: |
+          set -euxo pipefail
+          CMD="${{ steps.buildcmd.outputs.BUILD_CMD }}"
+          set +e; bash -lc "$CMD" | tee build.log; EXIT=$?; set -e
+          echo "EXIT_CODE=$EXIT" >> "$GITHUB_OUTPUT"
+          [ -s build.log ] || echo "(no build output captured)" > build.log
+          exit 0
+        continue-on-error: true
+
+      - name: Attempt AI auto-fix (OpenAI → llama fallback)
+        if: always() && steps.build.outputs.EXIT_CODE != '0'
+        env:
+          PROVIDER: openai
+          FALLBACK_PROVIDER: llama
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'gpt-4o-mini' }}
+          MODEL_PATH: models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
+          AI_BUILDER_ATTEMPTS: "3"
+          BUILD_CMD: ${{ steps.buildcmd.outputs.BUILD_CMD }}
+        run: python3 tools/AirysDark-AI_builder.py || true
+```
 
 ---
 
 ## ✅ Summary
-- Run **AirysDark-AI_detector** → generates per-type workflows via PR.
-- Use **AirysDark-AI_universal** → reusable workflow for any repo.
-- Point `uses:` to your builder repo, and set `project_dir` / `build_cmd` as needed.
+- Run **AirysDark-AI_detector** → generates per-type workflows via PR.  
+- Use **AirysDark-AI_universal** → reusable workflow for any repo.  
+- Point `uses:` to your builder repo, and set `project_dir` / `build_cmd` as needed.  
 - Add `BOT_TOKEN` secret (+ optional `OPENAI_API_KEY`) for automation.
