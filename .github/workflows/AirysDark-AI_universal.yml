@@ -23,7 +23,6 @@ permissions:
 jobs:
   universal:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
@@ -31,6 +30,17 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.11" }
       - run: pip install requests
+
+      # Ensure tools/ has the AI builder scripts
+      - name: Ensure AirysDark-AI tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p tools
+          BASE_URL="https://raw.githubusercontent.com/AirysDark/AirysDark-AI_Builder/main/tools"
+          [ -f tools/AirysDark-AI_detector.py ] || curl -fL "$BASE_URL/AirysDark-AI_detector.py" -o tools/AirysDark-AI_detector.py
+          [ -f tools/AirysDark-AI_builder.py ]  || curl -fL "$BASE_URL/AirysDark-AI_builder.py"  -o tools/AirysDark-AI_builder.py
+          ls -la tools
 
       - name: Detect & choose build command
         id: buildcmd

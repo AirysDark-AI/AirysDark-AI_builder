@@ -54,22 +54,16 @@ jobs:
       - name: Install deps
         run: pip install requests pyyaml
 
-      # 👇 Always create tools/ in THIS (mystery) repo and fetch the scripts
-      - name: Prepare AirysDark-AI tools
+      # Always ensure tools/ has the detector + builder scripts
+      - name: Ensure AirysDark-AI tools
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p tools
-
-          # canonical source of the scripts
           BASE_URL="https://raw.githubusercontent.com/AirysDark/AirysDark-AI_Builder/main/tools"
-
-          curl -fL "$BASE_URL/AirysDark-AI_detector.py" -o tools/AirysDark-AI_detector.py
-          curl -fL "$BASE_URL/AirysDark-AI_builder.py"  -o tools/AirysDark-AI_builder.py
-
-          # sanity check
+          [ -f tools/AirysDark-AI_detector.py ] || curl -fL "$BASE_URL/AirysDark-AI_detector.py" -o tools/AirysDark-AI_detector.py
+          [ -f tools/AirysDark-AI_builder.py ]  || curl -fL "$BASE_URL/AirysDark-AI_builder.py"  -o tools/AirysDark-AI_builder.py
           ls -la tools
-          python3 --version
 
       - name: Generate workflows + autobuilder script
         run: python3 ./tools/AirysDark-AI_detector.py
@@ -130,6 +124,17 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.11" }
       - run: pip install requests
+
+      # Ensure tools/ has the AI builder scripts
+      - name: Ensure AirysDark-AI tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p tools
+          BASE_URL="https://raw.githubusercontent.com/AirysDark/AirysDark-AI_Builder/main/tools"
+          [ -f tools/AirysDark-AI_detector.py ] || curl -fL "$BASE_URL/AirysDark-AI_detector.py" -o tools/AirysDark-AI_detector.py
+          [ -f tools/AirysDark-AI_builder.py ]  || curl -fL "$BASE_URL/AirysDark-AI_builder.py"  -o tools/AirysDark-AI_builder.py
+          ls -la tools
 
       - name: Detect & choose build command
         id: buildcmd
