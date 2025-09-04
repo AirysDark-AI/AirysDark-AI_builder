@@ -4,6 +4,8 @@
 # - Generates one workflow per detected type:
 #     .github/workflows/AirysDark-AI_<type>.yml
 # - Linux type supports Makefile and Meson/Ninja automatically
+# - Uploads build.log, AI patch, and common build outputs as artifacts
+# - Uses PAT (secrets.BOT_TOKEN) for PR creation with workflow file changes
 
 import os
 import pathlib
@@ -66,39 +68,102 @@ def detect_types():
             deduped.append(t)
     return deduped
 
-# ---------- Build commands ----------
+# ---------- Build commands (smart subdir resolution) ----------
 BUILD_CMDS = {
-    "android": "./gradlew assembleDebug --stacktrace",
-    "cmake":   "cmake -S . -B build && cmake --build build -j",
-    "node":    "npm ci && npm run build --if-present",
-    "python":  "pip install -e . && pytest || python -m pytest",
-    "rust":    "cargo build --locked --all-targets --verbose",
-    "dotnet":  "dotnet restore && dotnet build -c Release",
-    "maven":   "mvn -B package --file pom.xml",
-    "flutter": "flutter build apk --debug",
-    "go":      "go build ./...",
+    # Android: try root gradlew; else find first **/gradlew and run there;
+    # also try -p <dir> form to point Gradle at the module folder.
+    "android": (
+        "bash -lc '"
+        "set -e; "
+        "if [ -x ./gradlew ]; then "
+        "  chmod +x ./gradlew || true; "
+        "  ./gradlew assembleDebug --stacktrace; "
+        "else "
+        "  g=$(git ls-files | grep -E \"(^|/)gradlew$\" | head -n1 || true); "
+        "  if [ -n \"$g\" ]; then "
+        "    d=$(dirname \"$g\"); chmod +x \"$g\" || true; "
+        "    (cd \"$d\" && ./gradlew assembleDebug --stacktrace) || ./gradlew -p \"$d\" assembleDebug --stacktrace; "
+        "  else "
+        "    echo \"No gradlew found\"; exit 1; "
+        "  fi; "
+        "fi'"
+    ),
+
+    # CMake: prefer top-level CMakeLists; else find first one and build there with a dedicated out dir.
+    "cmake": (
+        "bash -lc '"
+        "set -e; "
+        "if [ -f CMakeLists.txt ]; then "
+        "  cmake -S . -B build && cmake --build build -j; "
+        "else "
+        "  t=$(git ls-files | grep -E \"(^|/)CMakeLists\\.txt$\" | head -n1 | xargs -I{} dirname {} || true); "
+        "  if [ -n \"$t\" ]; then "
+        "    cmake -S \"$t\" -B \"build/${t//\\//_}\" && cmake --build \"build/${t//\\//_}\" -j; "
+        "  else "
+        "    echo \"No CMakeLists.txt found\"; exit 1; "
+        "  fi; "
+        "fi'"
+    ),
+
+    # Node: prefer root; else iterate all package.json and build first that succeeds.
+    "node": (
+        "bash -lc '"
+        "set -e; "
+        "if [ -f package.json ]; then "
+        "  npm ci && npm run build --if-present; "
+        "else "
+        "  ok=; shopt -s globstar nullglob; "
+        "  for p in **/package.json; do d=${p%/*}; "
+        "    (cd \"$d\" && npm ci && npm run build --if-present) && ok=1 && break || true; "
+        "  done; "
+        "  [ -n \"$ok\" ] || { echo \"No package.json built\"; exit 1; }; "
+        "fi'"
+    ),
+
+    # Python: prefer root; else try each pyproject/setup.
+    "python": (
+        "bash -lc '"
+        "set -e; "
+        "if [ -f pyproject.toml ] || [ -f setup.py ]; then "
+        "  pip install -e .; (pytest || python -m pytest || true); "
+        "else "
+        "  ok=; shopt -s globstar nullglob; "
+        "  for t in **/pyproject.toml **/setup.py; do d=${t%/*}; "
+        "    (cd \"$d\" && pip install -e . && (pytest || python -m pytest || true)) && ok=1 && break || true; "
+        "  done; "
+        "  [ -n \"$ok\" ] || { echo \"No python project found\"; exit 1; }; "
+        "fi'"
+    ),
+
+    "rust":   "cargo build --locked --all-targets --verbose",
+    "dotnet": "bash -lc 'set -e; dotnet restore; dotnet build -c Release'",
+    "maven":  "mvn -B package --file pom.xml",
+    "flutter":"flutter build apk --debug",
+    "go":     "go build ./...",
+
     # Linux: Makefile (root or first found) → make; else Meson/Ninja (root or first found)
     "linux": (
         "bash -lc '"
+        "set -e; "
         "if [ -f Makefile ]; then "
         "  make -j; "
         "else "
-        "  set -e; "
-        "  d=$(git ls-files | grep -E \"(^|/)Makefile$\" | head -n1 | xargs -I{} dirname {}); "
+        "  d=$(git ls-files | grep -E \"(^|/)Makefile$\" | head -n1 | xargs -I{} dirname {} || true); "
         "  if [ -n \"$d\" ]; then "
         "    make -C \"$d\" -j; "
         "  elif [ -f meson.build ]; then "
         "    (meson setup build --wipe || true); meson setup build || true; ninja -C build; "
         "  else "
-        "    d=$(git ls-files | grep -E \"(^|/)meson.build$\" | head -n1 | xargs -I{} dirname {}); "
-        "    if [ -n \"$d\" ]; then "
-        "      (cd \"$d\" && (meson setup build --wipe || true); meson setup build || true; ninja -C build); "
+        "    m=$(git ls-files | grep -E \"(^|/)meson\\.build$\" | head -n1 | xargs -I{} dirname {} || true); "
+        "    if [ -n \"$m\" ]; then "
+        "      (cd \"$m\" && (meson setup build --wipe || true); meson setup build || true; ninja -C build); "
         "    else "
-        "      echo \"No Makefile or meson.build found; cannot run linux build\"; exit 1; "
+        "      echo \"No Makefile or meson.build found\"; exit 1; "
         "    fi; "
         "  fi; "
         "fi'"
     ),
+
     "unknown": "echo 'No build system detected' && exit 1",
 }
 
@@ -161,7 +226,7 @@ def setup_steps(ptype: str) -> str:
     # cmake/python/unknown don't need extra setup beyond setup-python
     return ""
 
-# ---------- Workflow writer ----------
+# ---------- Workflow writer (with artifacts + temp llama.cpp) ----------
 def write_workflow(ptype: str, cmd: str):
     setup = setup_steps(ptype)
     yaml = f"""
@@ -206,13 +271,28 @@ def write_workflow(ptype: str, cmd: str):
               echo "BUILD_CMD=$CMD" >> "$GITHUB_OUTPUT"
               set +e; bash -lc "$CMD" | tee build.log; EXIT=$?; set -e
               echo "EXIT_CODE=$EXIT" >> "$GITHUB_OUTPUT"
-              [ -f build.log ] || echo "(no build output captured)" > build.log
+              [ -s build.log ] || echo "(no build output captured)" > build.log
               exit 0
             continue-on-error: true
 
+          # --- Upload build log early so you always get it ---
+          - name: Upload build log
+            if: always()
+            uses: actions/upload-artifact@v4
+            with:
+              name: {ptype}-build-log
+              path: build.log
+              if-no-files-found: warn
+              retention-days: 7
+
           # --- AI auto-fix block (OpenAI → llama fallback) ---
-          - name: Build llama.cpp (CMake, no CURL)
+          - name: Build llama.cpp (CMake, no CURL, in temp)
+            if: always() && steps.build.outputs.EXIT_CODE != '0'
             run: |
+              set -euxo pipefail
+              TMP="${{{{ runner.temp }}}}"
+              cd "$TMP"
+              rm -rf llama.cpp
               git clone --depth=1 https://github.com/ggml-org/llama.cpp
               cd llama.cpp
               cmake -S . -B build -D CMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF
@@ -220,6 +300,7 @@ def write_workflow(ptype: str, cmd: str):
               echo "LLAMA_CPP_BIN=$PWD/build/bin/llama-cli" >> $GITHUB_ENV
 
           - name: Fetch GGUF model (TinyLlama)
+            if: always() && steps.build.outputs.EXIT_CODE != '0'
             run: |
               mkdir -p models
               curl -L -o models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \\
@@ -237,6 +318,43 @@ def write_workflow(ptype: str, cmd: str):
               BUILD_CMD: ${{{{ steps.build.outputs.BUILD_CMD }}}}
             run: python3 tools/AirysDark-AI_builder.py || true
 
+          # --- Upload any auto-fix patch the AI created ---
+          - name: Upload AI patch (if any)
+            if: always()
+            uses: actions/upload-artifact@v4
+            with:
+              name: {ptype}-ai-patch
+              path: .pre_ai_fix.patch
+              if-no-files-found: ignore
+              retention-days: 7
+
+          # --- Upload build outputs (best-effort, cross-ecosystem) ---
+          - name: Upload build artifacts
+            if: always()
+            uses: actions/upload-artifact@v4
+            with:
+              name: {ptype}-artifacts
+              if-no-files-found: ignore
+              retention-days: 7
+              path: |
+                build/**
+                out/**
+                dist/**
+                target/**
+                **/build/**
+                **/out/**
+                **/dist/**
+                **/target/**
+                **/*.so
+                **/*.a
+                **/*.dll
+                **/*.dylib
+                **/*.exe
+                **/*.bin
+                **/outputs/**/*.apk
+                **/outputs/**/*.aab
+                **/*.whl
+
           # --- Only open PR if changes exist (use PAT with workflow scope) ---
           - name: Check for changes
             id: diff
@@ -244,7 +362,7 @@ def write_workflow(ptype: str, cmd: str):
               git add -A
               if git diff --cached --quiet; then
                 echo "changed=false" >> "$GITHUB_OUTPUT"
-              else:
+              else
                 echo "changed=true" >> "$GITHUB_OUTPUT"
               fi
 
