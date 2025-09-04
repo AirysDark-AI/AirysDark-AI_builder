@@ -28,37 +28,48 @@ def exists_any(patterns):
     return False
 
 def detect_types():
+    """
+    Prioritize Android/Gradle. Generate CMake only if there is a *top-level*
+    CMakeLists.txt and NO Gradle (avoids Android+NDK double-generation).
+    """
     types = []
-    # android / gradle
-    if (ROOT / "gradlew").exists() or exists_any(["**/gradlew", "**/build.gradle*", "**/settings.gradle*"]):
+
+    has_gradle = (ROOT / "gradlew").exists() or exists_any([
+        "**/gradlew", "**/build.gradle*", "**/settings.gradle*"
+    ])
+    if has_gradle:
         types.append("android")
-    # cmake
-    if (ROOT / "CMakeLists.txt").exists() or exists_any(["**/CMakeLists.txt"]):
+
+    has_top_cmake = (ROOT / "CMakeLists.txt").exists()
+    if has_top_cmake and not has_gradle:
         types.append("cmake")
-    # node
+
     if (ROOT / "package.json").exists():
         types.append("node")
-    # python
     if (ROOT / "setup.py").exists() or (ROOT / "pyproject.toml").exists():
         types.append("python")
-    # rust
     if (ROOT / "Cargo.toml").exists():
         types.append("rust")
-    # dotnet
     if exists_any(["*.sln", "**/*.csproj", "**/*.fsproj"]):
         types.append("dotnet")
-    # maven
     if (ROOT / "pom.xml").exists():
         types.append("maven")
-    # flutter
     if (ROOT / "pubspec.yaml").exists():
         types.append("flutter")
-    # go
     if (ROOT / "go.mod").exists():
         types.append("go")
+
     if not types:
         types.append("unknown")
-    return types
+
+    # de-dupe while preserving order
+    seen = set()
+    dedup = []
+    for t in types:
+        if t not in seen:
+            dedup.append(t)
+            seen.add(t)
+    return dedup
 
 # ---------- Build commands ----------
 BUILD_CMDS = {
@@ -125,10 +136,9 @@ def setup_steps(ptype: str) -> str:
     # cmake/python/unknown don't need extra setup beyond setup-python
     return ""
 
-# ---------- YAML write (UPDATED) ----------
+# ---------- Workflow writer (includes Run button + reusable + PAT PR) ----------
 def write_workflow(ptype: str, cmd: str):
     setup = setup_steps(ptype)
-    # Expanded triggers include workflow_dispatch (Run button) and workflow_call (reusable)
     yaml = f"""
     name: AirysDark-AI — {ptype.capitalize()} (generated)
 
@@ -236,7 +246,8 @@ def write_workflow(ptype: str, cmd: str):
 def main():
     types = detect_types()
     for t in types:
-        write_workflow(t, BUILD_CMDS[t])
+        cmd = BUILD_CMDS.get(t, BUILD_CMDS["unknown"])
+        write_workflow(t, cmd)
     print(f"Done. Generated {len(types)} workflow(s) in {WF}")
 
 if __name__ == "__main__":
