@@ -1,4 +1,3 @@
-# Copy this into ANOTHER repo as .github/workflows/autobuilder.yml
 name: Project Autobuilder (AirysDark-AI Reusable)
 
 on:
@@ -11,5 +10,6 @@ jobs:
     uses: AirysDark/AirysDark-AI_Builder/.github/workflows/AirysDark-AI_universal.yml@main
     secrets: inherit
     with:
-      project_dir: "."
-      # build_cmd: "custom build command (optional)"
+      project_dir: "."       # root
+      # project_dir: "backend"   # or a subfolder
+      # build_cmd: "pip install -e . && pytest"   # optional override
