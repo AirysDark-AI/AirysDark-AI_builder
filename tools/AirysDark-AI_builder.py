@@ -191,8 +191,8 @@ def main():
     print(f"Provider: {PROVIDER}, Model: {OPENAI_MODEL}, Fallback: {FALLBACK_PROVIDER}")
     if not (PROJECT_ROOT / ".git").exists():
         run("git init")
-        run('git config user.name "ai-autobuilder"')
-        run('git config user.email "ai-autobuilder@local"')
+        run('git config user.name "AirysDark-AI_builder"')
+        run('git config user.email "AirysDark-AI_builder@users.noreply.github.com"')
         git("add", "-A")
         run('git commit -m "ai-autobuilder: initial snapshot" || true')
 

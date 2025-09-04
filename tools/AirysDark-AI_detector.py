@@ -124,7 +124,7 @@ def common_ai():
           MODEL_PATH: models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
           AI_BUILDER_ATTEMPTS: "2"
           BUILD_CMD: ${{ steps.build.outputs.BUILD_CMD }}
-        run: python3 tools/ai_autobuilder.py || true
+        run: python3 tools/AirysDark-AI_builder.py || true
     """)
 
 # ---------- Workflow writer ----------
