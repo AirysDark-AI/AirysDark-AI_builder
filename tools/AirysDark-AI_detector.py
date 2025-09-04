@@ -519,7 +519,7 @@ def write_probe_workflow_for_type(ptype: str):
                 - Probed command: ${{ steps.probe.outputs.BUILD_CMD }}
                 - Next: merge this PR, then run **AirysDark-AI — {ptype.capitalize()} (generated)**
               labels: automation, ci
-
+    """
     (WF / f"AirysDark-AI_prob_{ptype}.yml").write_text(textwrap.dedent(yaml))
     print(f"✅ Generated: AirysDark-AI_prob_{ptype}.yml")
 
