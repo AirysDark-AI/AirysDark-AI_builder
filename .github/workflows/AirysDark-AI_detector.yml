@@ -46,35 +46,41 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "### AirysDark-AI: detector results" > pr_body.md
-          echo "" >> pr_body.md
-          if [ -f tools/airysdark_ai_scan.json ]; then
-            echo "**Detected build types:**" >> pr_body.md
-            python3 - <<'PY' >> pr_body.md
-import json, sys
-from pathlib import Path
-p = Path("tools/airysdark_ai_scan.json")
-j = json.loads(p.read_text(errors="ignore")) if p.exists() else {}
-types = j.get("types", [])
-evid  = j.get("evidence", {})
-if types:
-    for t in types:
-        print(f"- {t}")
-        for ev in (evid.get(t, [])[:6] or []):
-            print(f"  - {ev}")
-else:
-    print("- (none)")
-PY
-          else
-            echo "_No detector JSON found (tools/airysdark_ai_scan.json)._" >> pr_body.md
+
+          # ensure jq exists
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y jq
           fi
+
           {
-            echo ""
+            echo "### AirysDark-AI: detector results"
+            echo
+          } > pr_body.md
+
+          if [ -f tools/airysdark_ai_scan.json ]; then
+            types_count=$(jq -r '.types // [] | length' tools/airysdark_ai_scan.json)
+            if [ "$types_count" != "0" ]; then
+              echo "**Detected build types:**" >> pr_body.md
+              while IFS= read -r t; do
+                echo "- ${t}" >> pr_body.md
+                jq -r --arg t "$t" '.evidence[$t] // [] | .[:6][] | "  - " + .' tools/airysdark_ai_scan.json >> pr_body.md
+              done < <(jq -r '.types[]' tools/airysdark_ai_scan.json)
+            else
+              echo "_No build types detected._" >> pr_body.md
+            fi
+          else
+            echo "_No detector JSON found (tools/airysdark_ai_scan.json)._"
+          fi >> pr_body.md
+
+          {
+            echo
             echo "**Next steps:**"
             echo "1. Edit \`.github/workflows/AirysDark-AI_prob.yml\` and set \`env.TARGET\` to the build you want (e.g. \`android\`, \`linux\`, \`cmake\`)."
             echo "2. Merge this PR."
             echo "3. From the Actions tab, manually run **AirysDark-AI - Probe (LLM builds workflow)**."
           } >> pr_body.md
+
           echo "PR_BODY_PATH=pr_body.md" >> "$GITHUB_OUTPUT"
 
       - name: Stage detector outputs
