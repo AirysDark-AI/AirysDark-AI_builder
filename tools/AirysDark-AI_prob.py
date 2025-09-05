@@ -1,267 +1,502 @@
 #!/usr/bin/env python3
 """
-AirysDark-AI_prob.py (Step 2)
-- Reads detector logs + JSON
-- Deep-scans entire repo (all folders/subfolders)
-- Builds a concise report and (optionally) asks the AI to produce a build workflow YAML
-- Writes:
-    .github/workflows/AirysDark-AI_build.yml
-    tools/airysdark_ai_prob_report.json
-    tools/airysdark_ai_prob_report.log
-    tools/airysdark_ai_build_ai_response.txt
-    pr_body_build.md
-"""
-import os, json, pathlib, datetime, re, sys
+AirysDark-AI_prob.py  — Step 2 (Probe)
+Reads detector output, scans the repo deeply, proposes a build command for TARGET,
+and generates a ready-to-run AirysDark-AI_build.yml workflow (manual trigger).
+If OPENAI_API_KEY is present, asks the LLM to draft the workflow; otherwise uses
+a validated fallback template.
 
-ROOT  = pathlib.Path(os.getenv("PROJECT_DIR", ".")).resolve()
+Outputs:
+- tools/airysdark_ai_prob_report.json
+- tools/airysdark_ai_prob_report.log
+- tools/airysdark_ai_build_ai_response.txt (if AI used)
+- .github/workflows/AirysDark-AI_build.yml
+- pr_body_build.md
+"""
+
+import os, sys, json, pathlib, textwrap, re
+
+ROOT = pathlib.Path(os.getenv("PROJECT_DIR", ".")).resolve()
 TOOLS = ROOT / "tools"
-WF    = ROOT / ".github" / "workflows"
-WF.mkdir(parents=True, exist_ok=True)
+WF_DIR = ROOT / ".github" / "workflows"
+WF_DIR.mkdir(parents=True, exist_ok=True)
 TOOLS.mkdir(parents=True, exist_ok=True)
 
-TARGET = os.getenv("TARGET", "__SET_ME__").strip()
+SCAN_JSON = TOOLS / "airysdark_ai_scan.json"
+PROB_JSON = TOOLS / "airysdark_ai_prob_report.json"
+PROB_LOG  = TOOLS / "airysdark_ai_prob_report.log"
+AI_OUT    = TOOLS / "airysdark_ai_build_ai_response.txt"
+PR_BODY   = ROOT / "pr_body_build.md"
+BUILD_WF  = WF_DIR / "AirysDark-AI_build.yml"
 
-REPORT_JSON = TOOLS / "airysdark_ai_prob_report.json"
-REPORT_LOG  = TOOLS / "airysdark_ai_prob_report.log"
-AI_OUT_TXT  = TOOLS / "airysdark_ai_build_ai_response.txt"
-PR_BODY     = ROOT / "pr_body_build.md"
-OUT_WORKFLOW= WF / "AirysDark-AI_build.yml"
+# ---------------- Utilities ----------------
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
-
-def read_text(p: pathlib.Path, max_bytes=200_000):
+def read_scan_json():
+    if not SCAN_JSON.exists():
+        return {}
     try:
-        b = p.read_bytes()[:max_bytes]
-        return b.decode("utf-8", errors="ignore")
-    except Exception:
-        try:
-            return p.read_text(errors="ignore")
-        except Exception:
-            return ""
+        return json.loads(SCAN_JSON.read_text(errors="ignore"))
+    except Exception as e:
+        return {"_error": f"failed to parse scan json: {e}"}
 
-def list_repo():
-    items = []
-    for root, dirs, files in os.walk(ROOT):
-        if ".git" in dirs:
-            dirs.remove(".git")
-        r = pathlib.Path(root)
-        rel_dir = str(r.relative_to(ROOT)) or "."
-        dir_entry = {"dir": rel_dir, "files": []}
-        for fn in files:
-            path = r / fn
-            try:
-                size = path.stat().st_size
-            except Exception:
-                size = -1
-            ext = pathlib.Path(fn).suffix.lower()
-            info = {"name": fn, "ext": ext, "size": size}
-            if size >= 0 and size <= 200*1024 and ext in (".gradle",".kts",".xml",".json",".yml",".yaml",".cmake",".txt",".md",".toml",".ini",".c",".cpp",".h",".hpp",".java",".kt",".py"):
-                info["preview"] = read_text(path, 40_000)
-            dir_entry["files"].append(info)
-        items.append(dir_entry)
-    return items
-
-def load_detector_data():
-    scan_log = (TOOLS / "airysdark_ai_scan.log").read_text(errors="ignore") if (TOOLS / "airysdark_ai_scan.log").exists() else ""
-    scan_json = {}
-    for candidate in ["airysdark_ai_scan.json", "airysdark_ai_detected.json"]:
-        p = TOOLS / candidate
-        if p.exists():
-            try:
-                scan_json = json.loads(p.read_text(errors="ignore"))
+def repo_snapshot(max_files=4000, max_text_lines=80):
+    files = []
+    doc_hints = {}
+    for r, ds, fs in os.walk(ROOT):
+        if ".git" in ds:
+            ds.remove(".git")
+        for fn in fs:
+            p = pathlib.Path(r) / fn
+            rel = str(p.relative_to(ROOT))
+            files.append(rel)
+            # capture heads of common text files for hints
+            if fn.lower().endswith((".md",".txt",".rst",".ini",".cfg",".toml",".gradle",".kts",".xml",".yml",".yaml",".json",".properties",".mk",".cmake",".ninja",".cfg",".conf",".bat",".ps1",".sh",".groovy",".kt",".java",".cpp",".c",".h",".hpp",".swift",".go",".cs",".py",".rb",".ts",".js",".mjs",".cjs")):
+                try:
+                    lines = p.read_text(errors="ignore").splitlines()[:max_text_lines]
+                    doc_hints[rel] = lines
+                except Exception:
+                    pass
+            if len(files) >= max_files:
                 break
-            except Exception:
-                pass
-    return scan_log, scan_json
+        if len(files) >= max_files:
+            break
+    return {"files": files, "doc_hints": doc_hints}
 
-def write_probe_reports(structure, detector_log, detector_json):
-    ts = datetime.datetime.utcnow().isoformat() + "Z"
-    REPORT_JSON.write_text(json.dumps({"timestamp": ts,"target": TARGET,"detector_log": detector_log,"detector_json": detector_json,"structure": structure}, indent=2))
-    with REPORT_LOG.open("w", encoding="utf-8") as f:
-        f.write(f"[{ts}] AirysDark-AI probe report (target={TARGET})\n\n")
-        f.write("Detected types (from detector): " + ", ".join(detector_json.get("types", [])) + "\n\n")
-        f.write("Directory structure summary:\n")
-        for d in structure[:200]:
-            f.write(f"- {d['dir']}/\n")
-            for fi in d["files"][:30]:
-                f.write(f"   {fi['name']} (ext={fi['ext']}, size={fi['size']})\n")
-        f.write("\n--- End of probe ---\n")
+def exists_any(globs):
+    for g in globs:
+        if list(ROOT.glob(g)):
+            return True
+    return False
 
-def extract_yaml_from_text(text):
-    m = re.search(r"```yaml\s+(.+?)```", text, flags=re.S|re.I)
-    if m: return m.group(1).strip()
-    m = re.search(r"```[^\n]*\n(.+?)```", text, flags=re.S)
-    if m: return m.group(1).strip()
-    if text.strip().lower().startswith(("name:", "on:", "permissions:", "jobs:", "env:")):
-        return text.strip()
+def find_first(globs):
+    for g in globs:
+        m = list(ROOT.glob(g))
+        if m:
+            return m[0]
+    return None
+
+# ---------------- Build command heuristics ----------------
+
+def guess_android_cmd():
+    # prefer nearest gradlew
+    wrappers = [ROOT / "gradlew", *ROOT.glob("**/gradlew")]
+    wrappers = [w for w in wrappers if w.exists()]
+    if not wrappers:
+        return "./gradlew assembleDebug --stacktrace"
+    g = wrappers[0]
+    gradle_dir = g.parent
+    # try to find modules from settings
+    mods = []
+    for sname in ("settings.gradle", "settings.gradle.kts"):
+        sp = gradle_dir / sname
+        if sp.exists():
+            txt = sp.read_text(errors="ignore")
+            incs = re.findall(r'include\s*\((.*?)\)', txt, flags=re.S|re.I)
+            for raw in incs:
+                parts = [p.strip(" '\"\t") for p in re.split(r'[,\s]+', raw.strip()) if p.strip()]
+                for p in parts:
+                    if p.startswith(":"):
+                        mods.append(p[1:])
+    # prefer :app assembleDebug
+    if mods:
+        for m in mods:
+            if m in ("app","mobile","android"):
+                return f'cd "{gradle_dir}" && ./gradlew :{m}:assembleDebug --stacktrace'
+    # fallbacks
+    return f'cd "{gradle_dir}" && ./gradlew assembleDebug --stacktrace'
+
+def guess_cmake_cmd():
+    root_cmake = ROOT / "CMakeLists.txt"
+    if root_cmake.exists():
+        return "cmake -S . -B build && cmake --build build -j"
+    first = find_first(["**/CMakeLists.txt"])
+    if first:
+        out = f'build/{str(first.parent).replace("/", "_")}'
+        return f'cmake -S "{first.parent}" -B "{out}" && cmake --build "{out}" -j'
+    return "echo 'No CMakeLists.txt found' && exit 1"
+
+def guess_linux_cmd():
+    mk = find_first(["Makefile","**/Makefile","**/GNUmakefile"])
+    if mk:
+        return f'make -C "{mk.parent}" -j'
+    # Meson/Ninja
+    mb = find_first(["meson.build","**/meson.build"])
+    if mb:
+        d = mb.parent
+        return f'(cd "{d}" && (meson setup build --wipe || true); meson setup build || true; ninja -C build)'
+    # plain ninja?
+    nb = find_first(["build.ninja","**/build.ninja"])
+    if nb:
+        return f'(cd "{nb.parent}" && ninja)'
+    return "echo 'No Linux build files found' && exit 1"
+
+def guess_node_cmd():
+    pkg = find_first(["package.json","**/package.json"])
+    if pkg:
+        return f'cd "{pkg.parent}" && npm ci && npm run build --if-present'
+    return "echo 'No package.json found' && exit 1"
+
+def guess_python_cmd():
+    pj = find_first(["pyproject.toml","**/pyproject.toml","setup.py","**/setup.py"])
+    if pj:
+        return f'cd "{pj.parent}" && pip install -e . && (pytest || python -m pytest || true)'
+    return "echo 'No python project found' && exit 1"
+
+def guess_rust_cmd():    return "cargo build --locked --all-targets --verbose"
+def guess_dotnet_cmd():  return "dotnet restore && dotnet build -c Release"
+def guess_maven_cmd():   return "mvn -B package --file pom.xml"
+def guess_flutter_cmd(): return "flutter build apk --debug"
+def guess_go_cmd():      return "go build ./..."
+
+def propose_build_cmd(target:str) -> str:
+    t = target.lower()
+    if t == "android": return guess_android_cmd()
+    if t == "cmake":   return guess_cmake_cmd()
+    if t == "linux":   return guess_linux_cmd()
+    if t == "node":    return guess_node_cmd()
+    if t == "python":  return guess_python_cmd()
+    if t == "rust":    return guess_rust_cmd()
+    if t == "dotnet":  return guess_dotnet_cmd()
+    if t == "maven":   return guess_maven_cmd()
+    if t == "flutter": return guess_flutter_cmd()
+    if t == "go":      return guess_go_cmd()
+    return "echo 'Unknown TARGET; update env.TARGET' && exit 1"
+
+# ---------------- Setup steps for build workflow ----------------
+
+def setup_steps_yaml(ptype:str) -> str:
+    if ptype == "android":
+        return textwrap.dedent("""\
+          - uses: actions/setup-java@v4
+            with:
+              distribution: temurin
+              java-version: "17"
+          - uses: android-actions/setup-android@v3
+          - run: yes | sdkmanager --licenses
+          - run: sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+        """)
+    if ptype == "node":
+        return textwrap.dedent("""\
+          - uses: actions/setup-node@v4
+            with:
+              node-version: "20"
+        """)
+    if ptype == "rust":
+        return textwrap.dedent("""\
+          - uses: dtolnay/rust-toolchain@stable
+          - run: rustc --version && cargo --version
+        """)
+    if ptype == "dotnet":
+        return textwrap.dedent("""\
+          - uses: actions/setup-dotnet@v4
+            with:
+              dotnet-version: "8.0.x"
+          - run: dotnet --info
+        """)
+    if ptype == "maven":
+        return textwrap.dedent("""\
+          - uses: actions/setup-java@v4
+            with:
+              distribution: temurin
+              java-version: "17"
+          - run: mvn --version
+        """)
+    if ptype == "flutter":
+        return textwrap.dedent("""\
+          - uses: subosito/flutter-action@v2
+            with:
+              flutter-version: "3.22.0"
+          - run: flutter --version
+        """)
+    if ptype == "go":
+        return textwrap.dedent("""\
+          - uses: actions/setup-go@v5
+            with:
+              go-version: "1.22"
+          - run: go version
+        """)
+    if ptype == "linux":
+        return textwrap.dedent("""\
+          - name: Install Meson & Ninja (Linux builds)
+            run: |
+              sudo apt-get update
+              sudo apt-get install -y meson ninja-build pkg-config
+        """)
+    # cmake/python/unknown rely on setup-python only
     return ""
 
-def heuristic_template(target:str) -> str:
-    base_cmd = {
-        "android": "bash -lc './gradlew assembleDebug --stacktrace'",
-        "linux":   "bash -lc 'make -j || ( [ -d linux ] && make -C linux -j ) || true'",
-        "cmake":   "bash -lc 'cmake -S . -B build && cmake --build build -j'",
-        "node":    "bash -lc 'npm ci && npm run build --if-present'",
-        "python":  "bash -lc 'pip install -e . && (pytest || python -m pytest || true)'",
-        "rust":    "bash -lc 'cargo build --locked --all-targets --verbose'",
-        "dotnet":  "bash -lc 'dotnet restore && dotnet build -c Release'",
-        "maven":   "bash -lc 'mvn -B package --file pom.xml'",
-        "flutter": "bash -lc 'flutter build apk --debug'",
-        "go":      "bash -lc 'go build ./...'",
-        "bazel":   "bash -lc 'bazel build //... || true'",
-        "scons":   "bash -lc 'scons -j$(nproc) || true'",
-        "ninja":   "bash -lc 'ninja -C build || true'",
-        "unknown": "bash -lc 'echo no-known-build-system && exit 1'"
-    }.get(target, "bash -lc 'echo no-known-build-system && exit 1'")
+# ---------------- Build workflow generation ----------------
 
-    return f"""name: AirysDark-AI - Build ({target})
+def render_build_workflow(target:str, build_cmd:str) -> str:
+    setup = setup_steps_yaml(target)
+    # Use placeholders to safely inject ${{ }} without Python formatting issues
+    tmpl = r"""
+name: AirysDark-AI - Build (__PTYPE__)
 
 on:
-  workflow_dispatch: {{}}  # manual only
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout (no credentials)
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: actions/setup-python@v5
-        with: {{ python-version: "3.11" }}
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-      - name: Install basics (best-effort)
+__SETUP__
+
+      - name: Verify AirysDark-AI tools exist
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y git curl ca-certificates
+          set -euxo pipefail
+          test -f tools/AirysDark-AI_builder.py
+          ls -la tools
 
-      - name: Build ({target})
-        run: {base_cmd}
+      - name: Build (capture)
+        id: build
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CMD="__BUILD_CMD__"
+          echo "BUILD_CMD=$CMD" >> "$GITHUB_OUTPUT"
+          set +e; bash -lc "$CMD" | tee build.log; EXIT=$?; set -e
+          echo "EXIT_CODE=$EXIT" >> "$GITHUB_OUTPUT"
+          [ -s build.log ] || echo "(no build output captured)" > build.log
+          exit 0
+        continue-on-error: true
 
-      - name: Upload outputs (best-effort)
+      - name: Upload build log
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: {target}-outputs
+          name: __PTYPE__-build-log
+          if-no-files-found: warn
+          retention-days: 7
+          path: build.log
+
+      # --- AI auto-fix (OpenAI → llama.cpp) ---
+      - name: Build llama.cpp (CMake, no CURL) in temp
+        if: always() && __GHA__ steps.build.outputs.EXIT_CODE __GHA_END__ != '0'
+        run: |
+          set -euxo pipefail
+          TMP="__GHA__ runner.temp __GHA_END__"
+          cd "$TMP"
+          rm -rf llama.cpp
+          git clone --depth=1 https://github.com/ggml-org/llama.cpp
+          cd llama.cpp
+          cmake -S . -B build -D CMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF
+          cmake --build build -j
+          echo "LLAMA_CPP_BIN=$PWD/build/bin/llama-cli" >> $GITHUB_ENV
+
+      - name: Fetch GGUF model (TinyLlama)
+        if: always() && __GHA__ steps.build.outputs.EXIT_CODE __GHA_END__ != '0'
+        run: |
+          mkdir -p models
+          curl -L -o models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
+            https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
+
+      - name: Attempt AI auto-fix (OpenAI → llama fallback)
+        if: always() && __GHA__ steps.build.outputs.EXIT_CODE __GHA_END__ != '0'
+        env:
+          PROVIDER: openai
+          FALLBACK_PROVIDER: llama
+          OPENAI_API_KEY: __GHA__ secrets.OPENAI_API_KEY __GHA_END__
+          OPENAI_MODEL: __GHA__ vars.OPENAI_MODEL || 'gpt-4o-mini' __GHA_END__
+          MODEL_PATH: models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
+          AI_BUILDER_ATTEMPTS: "3"
+          BUILD_CMD: __GHA__ steps.build.outputs.BUILD_CMD __GHA_END__
+        run: python3 tools/AirysDark-AI_builder.py || true
+
+      - name: Upload AI patch (if any)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: __PTYPE__-ai-patch
+          path: .pre_ai_fix.patch
           if-no-files-found: ignore
           retention-days: 7
-          path: |
-            build/**
-            out/**
-            dist/**
-            target/**
-            **/build/**
-            **/out/**
-            **/dist/**
-            **/target/**
-            **/*.so
-            **/*.a
-            **/*.dll
-            **/*.dylib
-            **/*.exe
-            **/*.whl
-            **/outputs/**/*.apk
-            **/outputs/**/*.aab
+
+      - name: Check for changes
+        id: diff
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git add -A
+          if git diff --cached --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else:
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create PR with AI fixes
+        if: __GHA__ steps.diff.outputs.changed __GHA_END__ == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: __GHA__ secrets.BOT_TOKEN __GHA_END__
+          branch: ai/airysdark-ai-autofix-__PTYPE__
+          commit-message: "chore: AirysDark-AI auto-fix (__PTYPE__)"
+          title: "AirysDark-AI: automated build fix (__PTYPE__)"
+          body: |
+            This PR was opened automatically by a build workflow after a failed build.
+            - Build command: __GHA__ steps.build.outputs.BUILD_CMD __GHA_END__
+            - Captured the failing build log
+            - Proposed a minimal fix via AI
+            - Committed the changes for review
+          labels: "automation, ci"
 """
+    ).lstrip("\n")
 
-def call_openai(messages):
-    import requests
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type":"application/json"}
-    data = {"model": OPENAI_MODEL, "messages": messages, "temperature": 0.2}
-    r = requests.post(url, headers=headers, json=data, timeout=180)
-    r.raise_for_status()
-    j = r.json()
-    return j["choices"][0]["message"]["content"]
+    setup_block = ""
+    if setup.strip():
+        setup_block = textwrap.indent(setup.rstrip("\n") + "\n", " " * 6)
 
-def synthesize_workflow_with_ai(target, detector_log, detector_json, structure):
-    # Compact, bounded structure summary to fit context
-    lines = []
-    max_dirs = 150
-    max_files_per_dir = 25
-    for d in structure[:max_dirs]:
-        lines.append(f"- {d['dir']}/")
-        for fi in d["files"][:max_files_per_dir]:
-            nm = fi["name"]; ex = fi["ext"]
-            lines.append(f"   {nm} (ext={ex})")
-    structure_text = "\n".join(lines)
-
-    sys_prompt = (
-        "You are a GitHub Actions expert. Given a repository scan and a target platform, "
-        "write a single, correct GitHub Actions workflow YAML file that builds the project."
+    yml = (tmpl
+           .replace("__SETUP__", setup_block.rstrip("\n"))
+           .replace("__PTYPE__", target)
+           .replace("__BUILD_CMD__", build_cmd.replace('"', '\\"'))
+           .replace("__GHA__", "${{")
+           .replace("__GHA_END__", "}}")
     )
-    user_prompt = f"""
-Target platform: {target}
+    return yml
 
-Constraints:
-- The workflow's filename will be .github/workflows/AirysDark-AI_build.yml
-- It MUST trigger only on: workflow_dispatch
-- It MUST NOT auto-run on push or pull_request
-- It MUST include needed setup steps for {target} (e.g., Java/Android SDK, CMake, Node, etc.)
-- Prefer reproducible, standard steps. Avoid secrets or PAT use here.
-- Upload typical build artifacts (build/, out/, dist/, target/, APK/AAB/whl, etc.)
-- Output ONLY a YAML workflow (no backticks, no prose). If unsure, provide a safe baseline for {target}.
+# ---------------- OpenAI (optional) ----------------
 
-Detector summary (truncated):
-{detector_log[:5000]}
+def call_openai(prompt:str) -> str:
+    import requests
+    api = os.getenv("OPENAI_API_KEY")
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    if not api:
+        raise RuntimeError("no_openai_key")
+    r = requests.post(
+        "https://api.openai.com/v1/chat/completions",
+        headers={"Authorization": f"Bearer {api}", "Content-Type": "application/json"},
+        json={
+            "model": model,
+            "messages": [
+                {"role":"system","content":"You are a CI assistant. Return only a valid GitHub Actions YAML workflow."},
+                {"role":"user","content": prompt}
+            ],
+            "temperature": 0.2
+        },
+        timeout=180
+    )
+    if r.status_code >= 400:
+        raise RuntimeError(f"openai_error {r.status_code}: {r.text[:400]}")
+    out = r.json()["choices"][0]["message"]["content"]
+    # strip code fences if present
+    out = re.sub(r"^```[a-zA-Z]*\n", "", out.strip())
+    out = re.sub(r"\n```$", "", out)
+    return out
 
-Detected types (JSON): {json.dumps(detector_json.get('types', []))}
+def build_ai_prompt(context:dict, target:str, build_cmd:str) -> str:
+    # Keep prompt compact but informative
+    files_list = "\n".join(context["repo"]["files"][:200])
+    detector_types = ", ".join(context["detector"].get("types", []))
+    return textwrap.dedent(f"""\
+    Draft a GitHub Actions workflow named "AirysDark-AI - Build ({target})".
+    Requirements:
+    - triggers: workflow_dispatch only.
+    - job: ubuntu-latest.
+    - set up toolchain for {target} (java/android, cmake, meson, node, python, etc as appropriate).
+    - run build command: {build_cmd}
+    - capture output to build.log, set EXIT_CODE output.
+    - if build fails, build llama.cpp (CMake, -DLLAMA_CURL=OFF), download TinyLlama GGUF, run "python3 tools/AirysDark-AI_builder.py".
+    - after AI step, upload .pre_ai_fix.patch and build.log artifacts.
+    - if git staged changes exist, open a PR with peter-evans/create-pull-request@v6 using token ${{{{ secrets.BOT_TOKEN }}}}, title & commit message quoting the target, labels "automation, ci".
+    - Do not fetch tools/*.py in this workflow; they were committed by the detector step.
+    - Use only YAML, no Markdown fences.
 
-Repo structure (trimmed):
-{structure_text[:20000]}
-""".strip()
+    Hints:
+    - Detected types: {detector_types}
+    - Proposed build: {build_cmd}
 
-    messages = [
-        {"role":"system","content":sys_prompt},
-        {"role":"user","content":user_prompt}
-    ]
-    text = call_openai(messages)
-    AI_OUT_TXT.write_text(text)
-    yaml = extract_yaml_from_text(text) or text.strip()
-    # Force manual-only trigger
-    if "on:" not in yaml.lower():
-        yaml = "on:\n  workflow_dispatch: {}\n" + yaml
-    yaml = re.sub(r"\bon:\s*\n(?:.*\n)*?(?=jobs:|env:|permissions:|name:|$)", "on:\n  workflow_dispatch: {}\n", yaml, count=1, flags=re.I)
-    return yaml
+    Partial file list (first 200):
+    {files_list}
+    """)
+
+# ---------------- Main ----------------
 
 def main():
-    if TARGET == "__SET_ME__":  # guard
-        print("TARGET is not set. Edit env.TARGET in the workflow and run again.", file=sys.stderr)
-        sys.exit(2)
+    target = os.getenv("TARGET", "__SET_ME__")
+    # 1) Load detector scan
+    scan = read_scan_json()
+    types = scan.get("types", [])
+    evidence = scan.get("evidence", {})
 
-    detector_log, detector_json = load_detector_data()
-    structure = list_repo()
-    write_probe_reports(structure, detector_log, detector_json)
+    # 2) Deep repo snapshot
+    snapshot = repo_snapshot()
 
-    yaml_text = ""
-    if OPENAI_API_KEY:
-        try:
-            yaml_text = synthesize_workflow_with_ai(TARGET, detector_log, detector_json, structure)
-        except Exception as e:
-            print(f"OpenAI failed: {e}", file=sys.stderr)
-            yaml_text = heuristic_template(TARGET)
+    # 3) Propose a build command for TARGET
+    build_cmd = propose_build_cmd(target)
+
+    # 4) Compose prob report
+    report = {
+        "target": target,
+        "proposed_build_cmd": build_cmd,
+        "detector": {"types": types, "evidence": evidence},
+        "repo": snapshot,
+    }
+    PROB_JSON.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    PROB_LOG.write_text("AirysDark-AI probe report\n\n" + json.dumps(report, indent=2), encoding="utf-8")
+
+    # 5) Generate workflow (AI if key present; fallback template otherwise)
+    used_ai = False
+    try:
+        prompt = build_ai_prompt(report, target, build_cmd)
+        wf_text = call_openai(prompt)
+        used_ai = True
+        AI_OUT.write_text(wf_text, encoding="utf-8")
+        # sanity: if AI forgot some key steps, fallback to our validated template
+        must_have = ["workflow_dispatch", "build.log", "peter-evans/create-pull-request"]
+        if not all(s in wf_text for s in must_have):
+            wf_text = render_build_workflow(target, build_cmd)
+    except Exception as e:
+        # No key or error — fallback to validated template
+        wf_text = render_build_workflow(target, build_cmd)
+
+    BUILD_WF.write_text(wf_text, encoding="utf-8")
+
+    # 6) PR body
+    body = []
+    body.append("### AirysDark-AI: Probe results")
+    body.append("")
+    if types:
+        body.append("**Detected build types (from detector):**")
+        for t in types:
+            body.append(f"- {t}")
+            for ev in evidence.get(t, []):
+                body.append(f"  - {ev}")
     else:
-        yaml_text = heuristic_template(TARGET)
+        body.append("_No build types detected by detector._")
+    body.append("")
+    body.append(f"**Selected target:** `{target}`")
+    body.append(f"**Proposed build command:** `{build_cmd}`")
+    body.append("")
+    body.append(f"- Workflow written: `.github/workflows/AirysDark-AI_build.yml`")
+    body.append(f"- AI drafted workflow: {'yes' if used_ai else 'no (template fallback)'}")
+    PR_BODY.write_text("\n".join(body) + "\n", encoding="utf-8")
 
-    OUT_WORKFLOW.write_text(yaml_text)
-    print(f"✅ Wrote workflow: {OUT_WORKFLOW}")
-
-    PR_BODY.write_text(
-        f"""### AirysDark-AI: build workflow (from probe)
-Target: **{TARGET}**
-
-This PR adds `.github/workflows/AirysDark-AI_build.yml`, generated by the probe.
-- The workflow triggers **only** on `workflow_dispatch` (manual run required).
-- Review the steps and adjust if needed.
-
-Artifacts from the probe:
-- `tools/airysdark_ai_prob_report.json`
-- `tools/airysdark_ai_prob_report.log`
-- `tools/airysdark_ai_build_ai_response.txt` (raw LLM output, if AI was used)
-"""
-    )
+    print("✅ Probe complete")
+    print(f"  Target: {target}")
+    print(f"  Build cmd: {build_cmd}")
+    print(f"  Report: {PROB_JSON}")
+    print(f"  Log:    {PROB_LOG}")
+    print(f"  AI out: {AI_OUT if AI_OUT.exists() else '(none)'}")
+    print(f"  Build workflow: {BUILD_WF}")
+    print(f"  PR body: {PR_BODY}")
+    return 0
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
