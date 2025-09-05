@@ -1,19 +1,12 @@
 #!/usr/bin/env python3
-# AirysDark-AI_detector.py (safe YAML: quoted 'on', quoted '**', block-style with:)
+# AirysDark-AI_detector.py (deep scan + safe YAML)
 #
-# Detects build types by scanning the entire repo (all subfolders/files).
-# Extras:
-#   - Folder-name hints (linux / android / windows)
-#   - CMakeLists.txt content inspection (flags linux when desktop-ish)
-#
-# Generates one PROBE workflow per detected type:
-#   .github/workflows/AirysDark-AI_prob_<type>.yml
-#
-# Each PROBE workflow:
-#   - Fetches tools (detector, probe, builder) from AirysDark-AI/AirysDark-AI_builder
-#   - Runs AirysDark-AI_probe.py to compute BUILD_CMD
-#   - Writes the final AI workflow .github/workflows/AirysDark-AI_<type>.yml (heredoc)
-#   - Pins git remote then opens PRs with peter-evans/create-pull-request using secrets.BOT_TOKEN
+# - Walks the entire repo (all subdirs) and reads relevant files.
+# - Folder-name hints (linux/android/windows).
+# - Android deep detection (manifest, Gradle plugin markers, module layout).
+# - CMake content-aware classification (desktop-ish => also flag linux).
+# - Emits PROBE workflows ("AirysDark-AI_prob_<type>.yml") with quoted 'on:' and block-style 'with:'.
+# - Probe workflow fetches tools, computes BUILD_CMD, writes final workflow, pins remote, opens PRs.
 #
 # Types: android, cmake, linux, node, python, rust, dotnet, maven, flutter, go, bazel, scons, ninja, unknown
 
@@ -21,35 +14,51 @@ import os
 import pathlib
 import textwrap
 import sys
+from typing import Iterable, Tuple, List, Set
 
 ROOT = pathlib.Path(os.getenv("PROJECT_DIR", ".")).resolve()
 WF = ROOT / ".github" / "workflows"
 WF.mkdir(parents=True, exist_ok=True)
 
-# ---------- Full-repo scan ----------
-def scan_all_files():
-    files = []
-    for root, dirs, filenames in os.walk(ROOT):
+# ---------- full repo scan ----------
+def scan_all_files() -> List[Tuple[pathlib.Path, pathlib.Path, str]]:
+    out: List[Tuple[pathlib.Path, pathlib.Path, str]] = []
+    for root, dirs, files in os.walk(ROOT):
         if ".git" in dirs:
             dirs.remove(".git")
-        for fn in filenames:
-            p = pathlib.Path(root) / fn
+        for fn in files:
+            ap = pathlib.Path(root) / fn
             try:
-                rel = p.relative_to(ROOT)
+                rp = ap.relative_to(ROOT)
             except Exception:
-                rel = p
-            files.append((fn.lower(), rel))
-    return files
+                rp = ap
+            out.append((ap, rp, fn.lower()))
+    return out
 
-def read_text_safe(p: pathlib.Path) -> str:
+def read_text_lower_safe(path: pathlib.Path) -> str:
     try:
-        return (ROOT / p).read_text(errors="ignore")
+        with open(path, "rb") as f:
+            data = f.read()
+        try:
+            return data.decode("utf-8", errors="ignore").lower()
+        except Exception:
+            return data.decode("latin-1", errors="ignore").lower()
     except Exception:
         return ""
 
-def collect_dir_name_hints(files):
-    names = set()
-    for _, rel in files:
+def any_file_contains(paths: Iterable[pathlib.Path], needles: Iterable[str]) -> bool:
+    needles_l = [n.lower() for n in needles]
+    for p in paths:
+        t = read_text_lower_safe(p)
+        if not t:
+            continue
+        if any(n in t for n in needles_l):
+            return True
+    return False
+
+def collect_dir_name_hints(files_index: List[Tuple[pathlib.Path, pathlib.Path, str]]) -> Set[str]:
+    names: Set[str] = set()
+    for _abs, rel, _fn in files_index:
         for part in pathlib.Path(rel).parts:
             names.add(part.lower())
     return names
@@ -72,52 +81,108 @@ def cmakelists_flavor(cm_txt: str) -> str:
         return "desktop"
     return "desktop"
 
-# ---------- Detect types ----------
-def detect_types():
-    files = scan_all_files()
-    fnames = [n for n, _ in files]
-    rels   = [str(p).lower() for _, p in files]
-    dir_hints = collect_dir_name_hints(files)
+# ---------- Android deep detection ----------
+ANDROID_PLUGIN_MARKERS = (
+    "com.android.application",
+    "com.android.library",
+    'id("com.android.application")',
+    'id("com.android.library")',
+)
 
-    types = []
+def has_android_signals(files_index: List[Tuple[pathlib.Path, pathlib.Path, str]], dir_hints: Set[str]) -> bool:
+    # strong: AndroidManifest anywhere
+    if any(fn == "androidmanifest.xml" for _, _, fn in files_index):
+        return True
+
+    # Gradle files anywhere
+    gradle_files = [
+        abs_p for (abs_p, _rel, fn) in files_index
+        if fn in ("build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts")
+    ]
+    wrappers = [abs_p for (abs_p, _rel, fn) in files_index if fn == "gradlew"]
+
+    if not gradle_files and not wrappers:
+        return False  # no Gradle at all
+
+    # Android plugin markers inside Gradle files
+    if any_file_contains(gradle_files, ANDROID_PLUGIN_MARKERS):
+        return True
+
+    # Typical Android module structure hints, alongside Gradle
+    rel_paths = [str(rel).lower() for (_abs, rel, _f) in files_index]
+    if any("/src/main/androidmanifest.xml" in rp for rp in rel_paths):
+        return True
+    if any("/res/" in rp or rp.endswith("/res") for rp in rel_paths):
+        return True
+    if any("/src/androidtest" in rp or "/src/test" in rp for rp in rel_paths):
+        return True
+
+    # Folder name "android" anywhere with Gradle present
+    if "android" in dir_hints and (gradle_files or wrappers):
+        return True
+
+    return False
+
+# ---------- detect types ----------
+def detect_types():
+    files_index = scan_all_files()
+    dir_hints   = collect_dir_name_hints(files_index)
+    fnames      = [fn for (_a, _r, fn) in files_index]
+    rels        = [str(rel).lower() for (_a, rel, _f) in files_index]
+
+    types: List[str] = []
 
     # folder-name hints
     if "linux" in dir_hints and "linux" not in types: types.append("linux")
     if "android" in dir_hints and "android" not in types: types.append("android")
     if "windows" in dir_hints and "windows" not in types: types.append("windows")
 
-    # gradle / android
-    if ("gradlew" in fnames) or any("build.gradle" in n or "settings.gradle" in n for n in fnames):
-        if "android" not in types: types.append("android")
+    # ANDROID deep
+    if has_android_signals(files_index, dir_hints):
+        if "android" not in types:
+            types.append("android")
 
-    # cmake (and infer linux when desktop-ish)
-    cmake_paths = [p for (n, p) in files if n == "cmakelists.txt"]
+    # CMAKE (content-aware)
+    cmake_paths = [abs_p for (abs_p, _rel, fn) in files_index if fn == "cmakelists.txt"]
     if cmake_paths and "cmake" not in types:
         types.append("cmake")
     for p in cmake_paths:
-        txt = read_text_safe(p)
-        if cmakelists_flavor(txt) == "desktop" and "linux" not in types:
+        txt = read_text_lower_safe(p)
+        if txt and cmakelists_flavor(txt) == "desktop" and "linux" not in types:
             types.append("linux")
 
-    # linux umbrella (make/meson/*.mk)
+    # LINUX umbrella (make/meson/*.mk)
     if ("makefile" in fnames) or ("gnumakefile" in fnames) or ("meson.build" in fnames) or any(r.endswith(".mk") for r in rels):
-        if "linux" not in types: types.append("linux")
+        if "linux" not in types:
+            types.append("linux")
 
-    if "package.json" in fnames and "node" not in types: types.append("node")
-    if ("pyproject.toml" in fnames or "setup.py" in fnames) and "python" not in types: types.append("python")
-    if "cargo.toml" in fnames and "rust" not in types: types.append("rust")
-    if any(r.endswith(".sln") or r.endswith(".csproj") or r.endswith(".fsproj") for r in rels) and "dotnet" not in types: types.append("dotnet")
-    if "pom.xml" in fnames and "maven" not in types: types.append("maven")
-    if "pubspec.yaml" in fnames and "flutter" not in types: types.append("flutter")
-    if "go.mod" in fnames and "go" not in types: types.append("go")
+    # other ecosystems
+    if "package.json" in fnames and "node" not in types:
+        types.append("node")
+    if ("pyproject.toml" in fnames or "setup.py" in fnames) and "python" not in types:
+        types.append("python")
+    if "cargo.toml" in fnames and "rust" not in types:
+        types.append("rust")
+    if any(r.endswith(".sln") or r.endswith(".csproj") or r.endswith(".fsproj") for r in rels) and "dotnet" not in types:
+        types.append("dotnet")
+    if "pom.xml" in fnames and "maven" not in types:
+        types.append("maven")
+    if "pubspec.yaml" in fnames and "flutter" not in types:
+        types.append("flutter")
+    if "go.mod" in fnames and "go" not in types:
+        types.append("go")
     if any(n in ("workspace", "workspace.bazel", "module.bazel") for n in fnames) or \
        any(os.path.basename(r) in ("build", "build.bazel") for r in rels):
-        if "bazel" not in types: types.append("bazel")
+        if "bazel" not in types:
+            types.append("bazel")
     if "sconstruct" in fnames or "sconscript" in fnames:
-        if "scons" not in types: types.append("scons")
-    if "build.ninja" in fnames and "ninja" not in types: types.append("ninja")
+        if "scons" not in types:
+            types.append("scons")
+    if "build.ninja" in fnames and "ninja" not in types:
+        types.append("ninja")
 
-    if not types: types.append("unknown")
+    if not types:
+        types.append("unknown")
 
     # de-dupe preserve order
     seen, out = set(), []
@@ -127,7 +192,7 @@ def detect_types():
             out.append(t)
     return out
 
-# ---------- Type-specific setup blocks ----------
+# ---------- setup snippets ----------
 def setup_steps_inline(ptype: str) -> str:
     if ptype == "android":
         return textwrap.dedent("""
@@ -204,10 +269,9 @@ def setup_steps_inline(ptype: str) -> str:
               sudo apt-get update
               sudo apt-get install -y ninja-build
         """)
-    # cmake/python/unknown: only setup-python is needed in the template
+    # cmake/python/unknown: only setup-python is required
     return ""
 
-# ---------- shared pin-remote block (YAML) ----------
 PIN_REMOTE_YAML = textwrap.dedent("""\
       - name: Pin git remote with token (just-in-time)
         env:
@@ -392,7 +456,7 @@ __SETUP_INLINE__
                       echo "changed=true" >> "$GITHUB_OUTPUT"
                     fi
 
-                # Make sure the PR step has credentials for prune/push
+                # Pin remote with BOT_TOKEN before creating PR (avoids credential issues)
                 - name: Pin git remote with token (just-in-time)
                   if: ${{ steps.diff.outputs.changed == 'true' }}
                   env:
@@ -424,7 +488,7 @@ __SETUP_INLINE__
                     labels: automation, ci
           YAML
 
-      # Pin before the PR that adds the final workflow file
+      # Pin before PR that adds the final workflow
       - name: Pin git remote with token (just-in-time)
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
@@ -448,7 +512,7 @@ __SETUP_INLINE__
           body: |
             This PR adds the final __PTYPE__ AI build workflow, generated by the probe run.
             - Probed command: ${{ steps.probe.outputs.BUILD_CMD }}
-            - Next: merge this PR, then run "AirysDark-AI - __PTYPE_CAP__ (generated)"
+            - Next: merge this PR, then run \"AirysDark-AI - __PTYPE_CAP__ (generated)\"
           labels: automation, ci
 """.lstrip("\n")
 
@@ -465,7 +529,7 @@ __SETUP_INLINE__
     (WF / f"AirysDark-AI_prob_{ptype}.yml").write_text(yaml)
     print(f"✅ Generated: AirysDark-AI_prob_{ptype}.yml")
 
-# ---------- Android-specific PROBE writer ----------
+# ---------- Android-specific PROBE writer (kept explicit) ----------
 def write_probe_workflow_for_android():
     setup_inline = setup_steps_inline("android")
 
@@ -643,7 +707,6 @@ __SETUP_INLINE__
                       echo "changed=true" >> "$GITHUB_OUTPUT"
                     fi
 
-                # Make sure the PR step has credentials for prune/push
                 - name: Pin git remote with token (just-in-time)
                   if: ${{ steps.diff.outputs.changed == 'true' }}
                   env:
@@ -675,7 +738,6 @@ __SETUP_INLINE__
                     labels: automation, ci
           YAML
 
-      # Pin before the PR that adds the final workflow file
       - name: Pin git remote with token (just-in-time)
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
@@ -714,7 +776,7 @@ __SETUP_INLINE__
     (WF / "AirysDark-AI_prob_android.yml").write_text(yaml)
     print("✅ Generated: AirysDark-AI_prob_android.yml")
 
-# ---------- Main ----------
+# ---------- main ----------
 def main():
     types = detect_types()
     print("Detected types:", ", ".join(types))

@@ -1,170 +1,261 @@
 #!/usr/bin/env python3
-import os, pathlib, textwrap, sys
+# AirysDark-AI_builder.py (OpenAI -> llama.cpp fallback)
+#
+# Env:
+#   PROVIDER=openai|llama      (default openai)
+#   OPENAI_API_KEY=...         (needed if PROVIDER=openai)
+#   OPENAI_MODEL=gpt-4o-mini   (override with repo/Actions vars)
+#   FALLBACK_PROVIDER=llama
+#   MODEL_PATH=models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
+#   LLAMA_CPP_BIN=llama-cli
+#   LLAMA_CTX=4096
+#   MAX_PROMPT_TOKENS=2500     (~4 chars/token crude)
+#   AI_LOG_TAIL=120
+#   MAX_FILES_IN_TREE=120
+#   RECENT_DIFF_MAX_CHARS=6000
+#   AI_BUILDER_ATTEMPTS=3
+#   BUILD_CMD=...              (must be supplied by the workflow)
+#   PROJECT_ROOT="."
+#
+# Output:
+#   - build.log (captured)
+#   - .pre_ai_fix.patch (staged diff before AI patch)
+#   - commits changes with message "airysdark-ai: apply automatic fix"
 
-ROOT = pathlib.Path(os.getenv("PROJECT_DIR", ".")).resolve()
-WF = ROOT / ".github" / "workflows"
-WF.mkdir(parents=True, exist_ok=True)
+import os, sys, subprocess, json, tempfile, re, pathlib, requests
 
-def exists_any(patterns):
-    for pat in patterns:
-        if list(ROOT.glob(pat)):
-            return True
-    return False
+# -------- Config (env-overridable) --------
+PROVIDER = os.getenv("PROVIDER", "openai")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-def detect_types():
-    types = []
-    if (ROOT / "gradlew").exists() or exists_any(["**/gradlew", "**/build.gradle*", "**/settings.gradle*"]):
-        types.append("android")
-    if (ROOT / "CMakeLists.txt").exists() or exists_any(["**/CMakeLists.txt"]):
-        types.append("cmake")
-    if (ROOT / "package.json").exists():
-        types.append("node")
-    if (ROOT / "setup.py").exists() or (ROOT / "pyproject.toml").exists():
-        types.append("python")
-    if (ROOT / "Cargo.toml").exists():
-        types.append("rust")
-    if exists_any(["*.sln", "**/*.csproj", "**/*.fsproj"]):
-        types.append("dotnet")
-    if (ROOT / "pom.xml").exists():
-        types.append("maven")
-    if (ROOT / "pubspec.yaml").exists():
-        types.append("flutter")
-    if (ROOT / "go.mod").exists():
-        types.append("go")
-    if not types:
-        types.append("unknown")
-    return types
+FALLBACK_PROVIDER = os.getenv("FALLBACK_PROVIDER", "llama")
+LLAMA_CPP_BIN = os.getenv("LLAMA_CPP_BIN", "llama-cli")
+LLAMA_MODEL_PATH = os.getenv("MODEL_PATH", "models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf")
 
-BUILD_CMDS = {
-    "android": "./gradlew assembleDebug --stacktrace",
-    "cmake":   "cmake -S . -B build && cmake --build build -j",
-    "node":    "npm ci && npm run build --if-present",
-    "python":  "pip install -e . && pytest || python -m pytest",
-    "rust":    "cargo build --locked --all-targets --verbose",
-    "dotnet":  "dotnet restore && dotnet build -c Release",
-    "maven":   "mvn -B package --file pom.xml",
-    "flutter": "flutter build apk --debug",
-    "go":      "go build ./...",
-    "unknown": "echo 'No build system detected' && exit 1",
-}
+LLAMA_CTX = int(os.getenv("LLAMA_CTX", "4096"))
+MAX_PROMPT_TOKENS = int(os.getenv("MAX_PROMPT_TOKENS", "2500"))
+AI_LOG_TAIL = int(os.getenv("AI_LOG_TAIL", "120"))
+MAX_FILES_IN_TREE = int(os.getenv("MAX_FILES_IN_TREE", "120"))
+RECENT_DIFF_MAX_CHARS = int(os.getenv("RECENT_DIFF_MAX_CHARS", "6000"))
 
-def setup_steps(ptype: str) -> str:
-    if ptype == "android":
-        return textwrap.dedent("""
-          - uses: actions/setup-java@v4
-            with: { distribution: temurin, java-version: "17" }
-          - uses: android-actions/setup-android@v3
-          - run: yes | sdkmanager --licenses
-          - run: sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
-        """)
-    if ptype == "node":
-        return textwrap.dedent("""
-          - uses: actions/setup-node@v4
-            with: { node-version: "20" }
-        """)
-    if ptype == "rust":
-        return textwrap.dedent("""
-          - uses: dtolnay/rust-toolchain@stable
-          - run: rustc --version && cargo --version
-        """)
-    if ptype == "dotnet":
-        return textwrap.dedent("""
-          - uses: actions/setup-dotnet@v4
-            with: { dotnet-version: "8.0.x" }
-          - run: dotnet --info
-        """)
-    if ptype == "maven":
-        return textwrap.dedent("""
-          - uses: actions/setup-java@v4
-            with: { distribution: temurin, java-version: "17" }
-          - run: mvn --version
-        """)
-    if ptype == "flutter":
-        return textwrap.dedent("""
-          - uses: subosito/flutter-action@v2
-            with: { flutter-version: "3.22.0" }
-          - run: flutter --version
-        """)
-    if ptype == "go":
-        return textwrap.dedent("""
-          - uses: actions/setup-go@v5
-            with: { go-version: "1.22" }
-          - run: go version
-        """)
-    return ""
+MAX_ATTEMPTS = int(os.getenv("AI_BUILDER_ATTEMPTS", "3"))
+BUILD_CMD = os.getenv("BUILD_CMD", "echo 'No BUILD_CMD set' && exit 1")
+PROJECT_ROOT = pathlib.Path(os.getenv("PROJECT_ROOT", ".")).resolve()
 
-def common_ai():
-    return textwrap.dedent("""
-      - name: Build llama.cpp (CMake, no CURL)
-        run: |
-          git clone --depth=1 https://github.com/ggml-org/llama.cpp
-          cd llama.cpp
-          cmake -S . -B build -D CMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF
-          cmake --build build -j
-          echo "LLAMA_CPP_BIN=$PWD/build/bin/llama-cli" >> $GITHUB_ENV
+PROMPT = """You are an automated build fixer operating on a Git repository.
 
-      - name: Fetch GGUF model (TinyLlama)
-        run: |
-          mkdir -p models
-          curl -L -o models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \\
-            https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
+GOAL: Fix build/test failures with the smallest, safest changes.
 
-      - name: Attempt AI auto-fix (OpenAI → llama fallback)
-        if: always() && steps.build.outputs.EXIT_CODE != '0'
-        env:
-          PROVIDER: openai
-          FALLBACK_PROVIDER: llama
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'gpt-4o-mini' }}
-          MODEL_PATH: models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
-          AI_BUILDER_ATTEMPTS: "2"
-          BUILD_CMD: ${{ steps.build.outputs.BUILD_CMD }}
-        run: python3 tools/AirysDark-AI_builder.py || true
-    """)
+Repository file list (truncated):
+{repo_tree}
 
-def write_workflow(ptype: str, cmd: str):
-    setup = setup_steps(ptype)
-    yaml = f"""
-    name: AirysDark-AI — {ptype.capitalize()} (generated)
+Recent changes (last few commits diff, truncated):
+{recent_diff}
 
-    on: [push, pull_request, workflow_dispatch]
+Build command:
+{build_cmd}
 
-    jobs:
-      build:
-        runs-on: ubuntu-latest
-        permissions:
-          contents: write
-          pull-requests: write
-        steps:
-          - uses: actions/checkout@v4
+Build log tail (last {ai_log_tail} lines):
+{build_tail}
 
-          - uses: actions/setup-python@v5
-            with: {{ python-version: "3.11" }}
-          - run: pip install requests
-{setup if setup.strip() else ""}
-          - name: Build (capture)
-            id: build
-            shell: bash
-            run: |
-              set -euxo pipefail
-              CMD="{cmd}"
-              echo "BUILD_CMD=$CMD" >> "$GITHUB_OUTPUT"
-              set +e; bash -lc "$CMD" | tee build.log; EXIT=$?; set -e
-              echo "EXIT_CODE=$EXIT" >> "$GITHUB_OUTPUT"
-              [ -f build.log ] || echo "(no build output captured)" > build.log
-              exit 0
-            continue-on-error: true
-{common_ai()}
-    """
-    out = WF / f"AirysDark-AI_{ptype}.yml"
-    out.write_text(textwrap.dedent(yaml))
-    print(f"✅ Generated: {out.name}")
+Constraints:
+- Return ONLY a valid unified diff starting with ---/+++ and @@ hunks.
+- Keep edits minimal, precise, and safe.
+- If build config changes are needed (Gradle/CMake/Workflow/etc.), include them in the diff.
+- Prefer updating APIs or versions only if that’s the root cause.
+- Do NOT modify unrelated files.
 
+Now output ONLY the unified diff to fix the error.
+"""
+
+# -------- helpers --------
+def run(cmd, cwd=PROJECT_ROOT, capture=False, check=False):
+    if capture:
+        return subprocess.run(cmd, cwd=cwd, shell=True, text=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=check)
+    else:
+        return subprocess.run(cmd, cwd=cwd, shell=True, check=check)
+
+def git(*args, capture=False):
+    return run("git " + " ".join(args), capture=capture)
+
+def get_repo_tree(max_files=MAX_FILES_IN_TREE):
+    out = run("git ls-files || true", capture=True)
+    files = out.stdout.strip().splitlines()
+    return "\n".join(files[:max_files])
+
+def get_recent_diff(max_chars=RECENT_DIFF_MAX_CHARS):
+    tip = run("git log --oneline -n 1 || true", capture=True).stdout.strip()
+    if not tip:
+        return "(no recent commits)"
+    diff = run("git diff --unified=2 -M -C HEAD~5..HEAD || true", capture=True).stdout
+    if not diff:
+        return "(no changes in last 5 commits)"
+    return diff[-max_chars:]
+
+def tail_build_log(lines=None):
+    if lines is None:
+        lines = AI_LOG_TAIL
+    p = pathlib.Path("build.log")
+    if not p.exists():
+        return "(no build log)"
+    data = p.read_text(errors="ignore").splitlines()
+    return "\n".join(data[-int(lines):])
+
+def truncate_prompt(p: str, max_tokens=MAX_PROMPT_TOKENS):
+    char_limit = max_tokens * 4
+    if len(p) <= char_limit:
+        return p
+    head = p[: int(char_limit * 0.60)]
+    tail = p[- int(char_limit * 0.35):]
+    return head + "\n\n[...prompt truncated to fit context...]\n\n" + tail
+
+def run_build():
+    with open("build.log", "wb") as f:
+        p = subprocess.Popen(BUILD_CMD, cwd=PROJECT_ROOT, shell=True,
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        for line in p.stdout:
+            sys.stdout.buffer.write(line)
+            f.write(line)
+    return p.wait()
+
+# -------- LLM calls --------
+def _call_openai(prompt):
+    key = os.environ.get("OPENAI_API_KEY")
+    if not key:
+        raise RuntimeError("openai_error: missing OPENAI_API_KEY")
+
+    url = "https://api.openai.com/v1/chat/completions"
+    payload = {
+        "model": OPENAI_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.2,
+    }
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+    }
+    if os.getenv("OPENAI_ORG"):
+        headers["OpenAI-Organization"] = os.environ["OPENAI_ORG"]
+
+    r = requests.post(url, headers=headers, json=payload, timeout=180)
+    if r.status_code >= 400:
+        try:
+            err = r.json()
+        except Exception:
+            err = {"raw": r.text}
+        print("OpenAI API error:", json.dumps(err, indent=2))
+        raise RuntimeError(f"openai_error:{json.dumps(err)}")
+    data = r.json()
+    return data["choices"][0]["message"]["content"]
+
+def _call_llama(prompt):
+    mp = pathlib.Path(LLAMA_MODEL_PATH)
+    if not mp.exists():
+        print(f"llama.cpp: MODEL_PATH not found: {mp}")
+        raise RuntimeError("llama_failed")
+
+    safe_prompt = truncate_prompt(prompt)
+    args = [
+        LLAMA_CPP_BIN,
+        "-m", str(mp),
+        "-p", safe_prompt,
+        "-n", "2048",
+        "--temp", "0.2",
+        "-c", str(LLAMA_CTX),
+    ]
+    out = subprocess.run(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if out.returncode != 0:
+        print("llama.cpp error output:\n", out.stdout)
+        raise RuntimeError("llama_failed")
+    return out.stdout
+
+def call_llm(prompt):
+    if PROVIDER == "openai":
+        try:
+            return _call_openai(prompt)
+        except RuntimeError as e:
+            if "openai_error" in str(e) and FALLBACK_PROVIDER == "llama":
+                print("⚠️ OpenAI failed (quota or request). Falling back to llama.cpp…")
+                return _call_llama(prompt)
+            raise
+    elif PROVIDER == "llama":
+        return _call_llama(prompt)
+    else:
+        raise RuntimeError(f"Unknown PROVIDER={PROVIDER}")
+
+# -------- patching --------
+def extract_unified_diff(text):
+    m = re.search(r'(?ms)^--- [^\n]+\n\+\+\+ [^\n]+\n', text)
+    if not m:
+        return None
+    return text[m.start():].strip()
+
+def apply_patch(diff_text):
+    tmp = tempfile.NamedTemporaryFile("w", delete=False, suffix=".patch")
+    tmp.write(diff_text)
+    tmp.close()
+    try:
+        git("add", "-A")
+        run("git diff --staged > .pre_ai_fix.patch || true")
+        run(f"git apply --reject --whitespace=fix {tmp.name}", capture=True)
+        git("add", "-A")
+        run('git commit -m "airysdark-ai: apply automatic fix" || true')
+        return True
+    except Exception as e:
+        print("Patch apply failed:", e)
+        return False
+    finally:
+        os.unlink(tmp.name)
+
+# -------- main --------
 def main():
-    types = detect_types()
-    for t in types:
-        write_workflow(t, BUILD_CMDS[t])
-    print(f"Done. Generated {len(types)} workflow(s) in {WF}")
+    print("== AirysDark-AI Builder (OpenAI → llama fallback) ==")
+    print("Project:", PROJECT_ROOT)
+    print(f"Provider: {PROVIDER}, Model: {OPENAI_MODEL}, Fallback: {FALLBACK_PROVIDER}")
+
+    if not (PROJECT_ROOT / ".git").exists():
+        run("git init")
+        run('git config user.name "airysdark-ai"')
+        run('git config user.email "airysdark-ai@local"')
+        git("add", "-A")
+        run('git commit -m "airysdark-ai: initial snapshot" || true')
+
+    code = run_build()
+    if code == 0:
+        print("✅ Build already succeeds. Nothing to do.")
+        return 0
+
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        print(f"\n== Attempt {attempt}/{MAX_ATTEMPTS} ==")
+        prompt = PROMPT.format(
+            repo_tree=get_repo_tree(),
+            recent_diff=get_recent_diff(),
+            build_cmd=BUILD_CMD,
+            ai_log_tail=AI_LOG_TAIL,
+            build_tail=tail_build_log(AI_LOG_TAIL),
+        )
+        llm_out = call_llm(prompt)
+        diff = extract_unified_diff(llm_out)
+        if not diff:
+            print("LLM did not return a unified diff. Aborting.")
+            break
+
+        print("\n--- Proposed diff (truncated) ---\n")
+        print(diff[:1500])
+        print("\n--- end preview ---\n")
+
+        if not apply_patch(diff):
+            print("Could not apply patch. Stopping.")
+            break
+
+        code = run_build()
+        if code == 0:
+            print("✅ Build fixed!")
+            return 0
+
+    print("❌ Still failing after attempts.")
+    return 1
 
 if __name__ == "__main__":
     sys.exit(main())
