@@ -6,7 +6,7 @@ Targets supported: **Android, Linux, CMake, Node, Python, Rust, .NET, Maven, Flu
 
 <p align="center">
   <a href="../../actions/workflows/AirysDark-AI_detector.yml">
-    <img alt="Detector status" src="https://img.shields.io/github/actions/workflow/status/AirysDark-AI_builder/tools/AirysDark-AI_detector.py?label=Detector">
+    <img alt="Detector status" src="https://img.shields.io/github/actions/workflow/status/AirysDark-AI_builder/AirysDark-AI_detector.yml?label=Detector">
   </a>
   <a href="../../actions/workflows/AirysDark-AI_prob.yml">
     <img alt="Probe status" src="https://img.shields.io/github/actions/workflow/status/AirysDark-AI_builder/AirysDark-AI_prob.yml?label=Probe">
