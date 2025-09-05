@@ -230,6 +230,20 @@ def write_prob_workflow():
       probe:
         runs-on: ubuntu-latest
         steps:
+          - name: Guard: require manual confirmation
+          if: ${{ github.event_name == 'workflow_dispatch' }}
+          run: |
+            if [ "${{ inputs.confirm }}" != "YES" ]; then
+            echo "Refusing to run: inputs.confirm must be YES"; exit 1
+            fi
+
+         - name: Guard: default branch only
+         run: |
+           if [ "${{ github.ref }}" != "refs/heads/$
+{{ github.event.repository.default_branch }}" ]; then
+            echo "This workflow only runs on the default branch."; exit 1
+           fi
+           
           - name: Checkout (no credentials)
             uses: actions/checkout@v4
             with:
