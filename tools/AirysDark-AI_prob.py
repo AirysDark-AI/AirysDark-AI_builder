@@ -1,26 +1,30 @@
 #!/usr/bin/env python3
 """
-AirysDark-AI_prob.py  — Step 2 (Probe)
-Reads detector output, scans the repo deeply, proposes a build command for TARGET,
-and generates a ready-to-run AirysDark-AI_build.yml workflow (manual trigger).
-If OPENAI_API_KEY is present, asks the LLM to draft the workflow; otherwise uses
-a validated fallback template.
-
-Outputs:
-- tools/airysdark_ai_prob_report.json
-- tools/airysdark_ai_prob_report.log
-- tools/airysdark_ai_build_ai_response.txt (if AI used)
-- .github/workflows/AirysDark-AI_build.yml
-- pr_body_build.md
+AirysDark-AI_prob.py — Step 2 (Probe)
+- Reads detector results (tools/airysdark_ai_scan.json)
+- Recursively scans the repo for structure and textual hints
+- Proposes a build command for env TARGET
+- Drafts a build workflow via OpenAI (if key available) or a validated fallback
+- Writes:
+    tools/airysdark_ai_prob_report.json
+    tools/airysdark_ai_prob_report.log
+    tools/airysdark_ai_build_ai_response.txt   (if AI used)
+    .github/workflows/AirysDark-AI_build.yml   (manual trigger)
+    pr_body_build.md                           (for the PR body)
 """
 
-import os, sys, json, pathlib, textwrap, re
+import os
+import re
+import sys
+import json
+import pathlib
+import textwrap
 
 ROOT = pathlib.Path(os.getenv("PROJECT_DIR", ".")).resolve()
 TOOLS = ROOT / "tools"
 WF_DIR = ROOT / ".github" / "workflows"
-WF_DIR.mkdir(parents=True, exist_ok=True)
 TOOLS.mkdir(parents=True, exist_ok=True)
+WF_DIR.mkdir(parents=True, exist_ok=True)
 
 SCAN_JSON = TOOLS / "airysdark_ai_scan.json"
 PROB_JSON = TOOLS / "airysdark_ai_prob_report.json"
@@ -37,9 +41,12 @@ def read_scan_json():
     try:
         return json.loads(SCAN_JSON.read_text(errors="ignore"))
     except Exception as e:
-        return {"_error": f"failed to parse scan json: {e}"}
+        return {"_error": f"failed to parse {SCAN_JSON}: {e}"}
 
-def repo_snapshot(max_files=4000, max_text_lines=80):
+def repo_snapshot(max_files=6000, max_text_lines=80):
+    """
+    Walk entire repo (except .git), list files, and capture heads of common text/code files.
+    """
     files = []
     doc_hints = {}
     for r, ds, fs in os.walk(ROOT):
@@ -47,15 +54,24 @@ def repo_snapshot(max_files=4000, max_text_lines=80):
             ds.remove(".git")
         for fn in fs:
             p = pathlib.Path(r) / fn
-            rel = str(p.relative_to(ROOT))
+            try:
+                rel = str(p.relative_to(ROOT))
+            except Exception:
+                rel = str(p)
             files.append(rel)
-            # capture heads of common text files for hints
-            if fn.lower().endswith((".md",".txt",".rst",".ini",".cfg",".toml",".gradle",".kts",".xml",".yml",".yaml",".json",".properties",".mk",".cmake",".ninja",".cfg",".conf",".bat",".ps1",".sh",".groovy",".kt",".java",".cpp",".c",".h",".hpp",".swift",".go",".cs",".py",".rb",".ts",".js",".mjs",".cjs")):
+
+            lower = fn.lower()
+            if lower.endswith((
+                ".md",".txt",".rst",".ini",".cfg",".toml",".gradle",".kts",".xml",".yml",".yaml",".json",
+                ".properties",".mk",".cmake",".ninja",".conf",".bat",".ps1",".sh",".groovy",".kt",".java",
+                ".cpp",".c",".h",".hpp",".swift",".go",".cs",".py",".rb",".ts",".js",".mjs",".cjs",".sql",
+            )):
                 try:
-                    lines = p.read_text(errors="ignore").splitlines()[:max_text_lines]
+                    lines = (p.read_text(errors="ignore").splitlines())[:max_text_lines]
                     doc_hints[rel] = lines
                 except Exception:
                     pass
+
             if len(files) >= max_files:
                 break
         if len(files) >= max_files:
@@ -70,22 +86,22 @@ def exists_any(globs):
 
 def find_first(globs):
     for g in globs:
-        m = list(ROOT.glob(g))
-        if m:
-            return m[0]
+        found = list(ROOT.glob(g))
+        if found:
+            return found[0]
     return None
 
 # ---------------- Build command heuristics ----------------
 
 def guess_android_cmd():
-    # prefer nearest gradlew
     wrappers = [ROOT / "gradlew", *ROOT.glob("**/gradlew")]
     wrappers = [w for w in wrappers if w.exists()]
     if not wrappers:
         return "./gradlew assembleDebug --stacktrace"
-    g = wrappers[0]
+    g = sorted(wrappers, key=lambda p: len(str(p))) [0]  # prefer nearest
     gradle_dir = g.parent
-    # try to find modules from settings
+
+    # Try to parse settings for modules
     mods = []
     for sname in ("settings.gradle", "settings.gradle.kts"):
         sp = gradle_dir / sname
@@ -97,12 +113,11 @@ def guess_android_cmd():
                 for p in parts:
                     if p.startswith(":"):
                         mods.append(p[1:])
-    # prefer :app assembleDebug
-    if mods:
-        for m in mods:
-            if m in ("app","mobile","android"):
-                return f'cd "{gradle_dir}" && ./gradlew :{m}:assembleDebug --stacktrace'
-    # fallbacks
+    # Prefer common modules
+    for m in mods:
+        if m in ("app","mobile","android"):
+            return f'cd "{gradle_dir}" && ./gradlew :{m}:assembleDebug --stacktrace'
+    # Fall back to assembleDebug at wrapper dir
     return f'cd "{gradle_dir}" && ./gradlew assembleDebug --stacktrace'
 
 def guess_cmake_cmd():
@@ -119,12 +134,10 @@ def guess_linux_cmd():
     mk = find_first(["Makefile","**/Makefile","**/GNUmakefile"])
     if mk:
         return f'make -C "{mk.parent}" -j'
-    # Meson/Ninja
     mb = find_first(["meson.build","**/meson.build"])
     if mb:
         d = mb.parent
         return f'(cd "{d}" && (meson setup build --wipe || true); meson setup build || true; ninja -C build)'
-    # plain ninja?
     nb = find_first(["build.ninja","**/build.ninja"])
     if nb:
         return f'(cd "{nb.parent}" && ninja)'
@@ -147,20 +160,30 @@ def guess_dotnet_cmd():  return "dotnet restore && dotnet build -c Release"
 def guess_maven_cmd():   return "mvn -B package --file pom.xml"
 def guess_flutter_cmd(): return "flutter build apk --debug"
 def guess_go_cmd():      return "go build ./..."
+def guess_bazel_cmd():   return "bazel build //..."
+def guess_scons_cmd():   return "scons -Q"
+def guess_ninja_cmd():
+    nb = find_first(["build.ninja","**/build.ninja"])
+    if nb:
+        return f'(cd "{nb.parent}" && ninja)'
+    return "ninja"
 
-def propose_build_cmd(target:str) -> str:
-    t = target.lower()
-    if t == "android": return guess_android_cmd()
-    if t == "cmake":   return guess_cmake_cmd()
-    if t == "linux":   return guess_linux_cmd()
-    if t == "node":    return guess_node_cmd()
-    if t == "python":  return guess_python_cmd()
-    if t == "rust":    return guess_rust_cmd()
-    if t == "dotnet":  return guess_dotnet_cmd()
-    if t == "maven":   return guess_maven_cmd()
-    if t == "flutter": return guess_flutter_cmd()
-    if t == "go":      return guess_go_cmd()
-    return "echo 'Unknown TARGET; update env.TARGET' && exit 1"
+def propose_build_cmd(target: str) -> str:
+    t = (target or "").lower()
+    if   t == "android": return guess_android_cmd()
+    elif t == "cmake":   return guess_cmake_cmd()
+    elif t == "linux":   return guess_linux_cmd()
+    elif t == "node":    return guess_node_cmd()
+    elif t == "python":  return guess_python_cmd()
+    elif t == "rust":    return guess_rust_cmd()
+    elif t == "dotnet":  return guess_dotnet_cmd()
+    elif t == "maven":   return guess_maven_cmd()
+    elif t == "flutter": return guess_flutter_cmd()
+    elif t == "go":      return guess_go_cmd()
+    elif t == "bazel":   return guess_bazel_cmd()
+    elif t == "scons":   return guess_scons_cmd()
+    elif t == "ninja":   return guess_ninja_cmd()
+    else:                return "echo 'Unknown TARGET; update env.TARGET' && exit 1"
 
 # ---------------- Setup steps for build workflow ----------------
 
@@ -222,14 +245,14 @@ def setup_steps_yaml(ptype:str) -> str:
               sudo apt-get update
               sudo apt-get install -y meson ninja-build pkg-config
         """)
-    # cmake/python/unknown rely on setup-python only
+    # cmake/python/bazel/scons/ninja/unknown rely on setup-python only
     return ""
 
 # ---------------- Build workflow generation ----------------
 
 def render_build_workflow(target:str, build_cmd:str) -> str:
     setup = setup_steps_yaml(target)
-    # Use placeholders to safely inject ${{ }} without Python formatting issues
+    # Use placeholders to avoid interfering with ${{ }} in YAML
     tmpl = r"""
 name: AirysDark-AI - Build (__PTYPE__)
 
@@ -367,13 +390,12 @@ __SETUP__
            .replace("__PTYPE__", target)
            .replace("__BUILD_CMD__", build_cmd.replace('"', '\\"'))
            .replace("__GHA__", "${{")
-           .replace("__GHA_END__", "}}")
-    )
+           .replace("__GHA_END__", "}}"))
     return yml
 
 # ---------------- OpenAI (optional) ----------------
 
-def call_openai(prompt:str) -> str:
+def call_openai(prompt: str) -> str:
     import requests
     api = os.getenv("OPENAI_API_KEY")
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
@@ -390,33 +412,32 @@ def call_openai(prompt:str) -> str:
             ],
             "temperature": 0.2
         },
-        timeout=180
+        timeout=180,
     )
     if r.status_code >= 400:
         raise RuntimeError(f"openai_error {r.status_code}: {r.text[:400]}")
-    out = r.json()["choices"][0]["message"]["content"]
+    out = r.json()["choices"][0]["message"]["content"].strip()
     # strip code fences if present
-    out = re.sub(r"^```[a-zA-Z]*\n", "", out.strip())
+    out = re.sub(r"^```[a-zA-Z]*\n", "", out)
     out = re.sub(r"\n```$", "", out)
     return out
 
-def build_ai_prompt(context:dict, target:str, build_cmd:str) -> str:
-    # Keep prompt compact but informative
+def build_ai_prompt(context: dict, target: str, build_cmd: str) -> str:
     files_list = "\n".join(context["repo"]["files"][:200])
     detector_types = ", ".join(context["detector"].get("types", []))
     return textwrap.dedent(f"""\
     Draft a GitHub Actions workflow named "AirysDark-AI - Build ({target})".
     Requirements:
-    - triggers: workflow_dispatch only.
-    - job: ubuntu-latest.
-    - set up toolchain for {target} (java/android, cmake, meson, node, python, etc as appropriate).
+    - triggers: workflow_dispatch only
+    - job: ubuntu-latest
+    - set up toolchain for {target} (java/android, cmake/meson, node, python, etc. as appropriate)
     - run build command: {build_cmd}
-    - capture output to build.log, set EXIT_CODE output.
-    - if build fails, build llama.cpp (CMake, -DLLAMA_CURL=OFF), download TinyLlama GGUF, run "python3 tools/AirysDark-AI_builder.py".
-    - after AI step, upload .pre_ai_fix.patch and build.log artifacts.
-    - if git staged changes exist, open a PR with peter-evans/create-pull-request@v6 using token ${{{{ secrets.BOT_TOKEN }}}}, title & commit message quoting the target, labels "automation, ci".
-    - Do not fetch tools/*.py in this workflow; they were committed by the detector step.
-    - Use only YAML, no Markdown fences.
+    - capture output to build.log, export EXIT_CODE via job outputs
+    - if build fails, build llama.cpp (CMake, -DLLAMA_CURL=OFF), download TinyLlama GGUF, run "python3 tools/AirysDark-AI_builder.py"
+    - upload build.log and .pre_ai_fix.patch as artifacts
+    - if git staged changes exist, open a PR with peter-evans/create-pull-request@v6 using token ${{{{ secrets.BOT_TOKEN }}}}, title & commit message referencing target, labels "automation, ci"
+    - Do not fetch tools in this workflow; they were committed by the detector step
+    - Return ONLY YAML (no code fences)
 
     Hints:
     - Detected types: {detector_types}
@@ -430,6 +451,7 @@ def build_ai_prompt(context:dict, target:str, build_cmd:str) -> str:
 
 def main():
     target = os.getenv("TARGET", "__SET_ME__")
+
     # 1) Load detector scan
     scan = read_scan_json()
     types = scan.get("types", [])
@@ -441,7 +463,7 @@ def main():
     # 3) Propose a build command for TARGET
     build_cmd = propose_build_cmd(target)
 
-    # 4) Compose prob report
+    # 4) Compose probe report
     report = {
         "target": target,
         "proposed_build_cmd": build_cmd,
@@ -451,20 +473,21 @@ def main():
     PROB_JSON.write_text(json.dumps(report, indent=2), encoding="utf-8")
     PROB_LOG.write_text("AirysDark-AI probe report\n\n" + json.dumps(report, indent=2), encoding="utf-8")
 
-    # 5) Generate workflow (AI if key present; fallback template otherwise)
+    # 5) Generate workflow (AI if key present; validated template otherwise)
     used_ai = False
     try:
         prompt = build_ai_prompt(report, target, build_cmd)
         wf_text = call_openai(prompt)
         used_ai = True
         AI_OUT.write_text(wf_text, encoding="utf-8")
-        # sanity: if AI forgot some key steps, fallback to our validated template
+        # sanity checks; fallback if something critical is missing
         must_have = ["workflow_dispatch", "build.log", "peter-evans/create-pull-request"]
         if not all(s in wf_text for s in must_have):
             wf_text = render_build_workflow(target, build_cmd)
-    except Exception as e:
-        # No key or error — fallback to validated template
+            used_ai = False
+    except Exception:
         wf_text = render_build_workflow(target, build_cmd)
+        used_ai = False
 
     BUILD_WF.write_text(wf_text, encoding="utf-8")
 
