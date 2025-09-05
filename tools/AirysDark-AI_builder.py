@@ -1,11 +1,20 @@
 #!/usr/bin/env python3
-# AirysDark-AI_builder.py
-# Smart, safe build-fixer with diff-only contract, retries, rollback-on-worse,
-# OpenAI→llama fallback, redaction, and rich artifacts.
+# AirysDark-AI_builder.py — smart build fixer with self-teaching memory
+#
+# Features:
+# - Tries previously learned patches for similar errors before calling the LLM
+# - Diff-only contract, patch safety (reject/3way), rollback-on-worse
+# - OpenAI → llama.cpp fallback
+# - Log/artifacts + allow/deny globs + dangerous file guard
 
-import os, sys, re, json, pathlib, subprocess, tempfile, shlex, datetime
+import os, sys, re, json, pathlib, subprocess, tempfile, shlex, datetime, hashlib
+from typing import Optional, Tuple, List, Dict, Any
 
 ROOT = pathlib.Path(os.getenv("PROJECT_ROOT", ".")).resolve()
+TOOLS = ROOT / "tools"
+KB_DIR = TOOLS / "ai_kb"
+KB_FILE = KB_DIR / "knowledge.jsonl"
+
 ATTEMPTS = int(os.getenv("AI_BUILDER_ATTEMPTS", "3"))
 PROVIDER = os.getenv("PROVIDER", "openai")            # openai | llama
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
@@ -34,8 +43,8 @@ AI_SUMMARY = ROOT / "ai_summary.txt"
 AI_ATTEMPTS_LOG = ROOT / ".ai_attempt.jsonl"
 
 DANGEROUS_PATH_HINTS = [
-    ".github/workflows/",  # CI definitions
-    ".git/",               # repo internals
+    ".github/workflows/",
+    ".git/",
     "secrets.", "keystore", "gradle.properties", "local.properties",
 ]
 
@@ -67,6 +76,8 @@ Constraints:
 
 If editing build systems, keep them consistent (e.g., Gradle plugin & Kotlin versions).
 """
+
+# ---------------- helpers ----------------
 
 def run(cmd, cwd=ROOT, capture=False, check=False, env=None):
     if capture:
@@ -106,7 +117,6 @@ def log_tail(lines=LOG_TAIL_LINES):
     return "\n".join(BUILD_LOG.read_text(errors="ignore").splitlines()[-lines:])
 
 def redact(text: str) -> str:
-    # scrub obvious secret-like tokens
     text = re.sub(r'(?:AKIA|ASIA|SK|GH|GHO|ghp_)\\w+', '***REDACTED***', text)
     text = re.sub(r'(?i)(api[-_ ]?key|token|secret)\\s*[:=]\\s*\\S+', '\\1: ***REDACTED***', text)
     return text
@@ -128,16 +138,14 @@ def build_once():
             f.write(line)
     return p.wait()
 
-def extract_unified_diff(text):
-    # Accepts diff starting at first '--- ' line
-    m = re.search(r'(?ms)^---\\s', text)
+def extract_unified_diff(text: str) -> Optional[str]:
+    m = re.search(r'(?ms)^---\\s', text or "")
     return text[m.start():].strip() if m else None
 
 def diff_touches_dangerous_paths(diff_text: str) -> bool:
     lower = diff_text.lower()
     for hint in DANGEROUS_PATH_HINTS:
         if hint in lower:
-            # allow only if explicitly permitted by allowlist
             if not ALLOWLIST_GLOBS:
                 return True
     return False
@@ -154,30 +162,27 @@ def path_allowed_by_globs(filepath: str) -> bool:
     return True
 
 def filter_diff_by_globs(diff_text: str) -> str:
-    # crude per-file filter: keep only file sections allowed by globs
+    # split on file boundaries and keep allowed files
     chunks = re.split(r'(?m)(?=^---\\s)', diff_text)
     kept = []
     for ch in chunks:
         if not ch.strip():
             continue
-        # try to read the "+++" path
         m = re.search(r'^\\+\\+\\+\\s+(?:b/)?(.+)$', ch, flags=re.M)
         path = m.group(1).strip() if m else ""
         if path and path_allowed_by_globs(path):
             kept.append(ch)
     return "".join(kept) if kept else ""
 
-def apply_patch(diff_text: str) -> tuple[bool, str]:
+def apply_patch(diff_text: str) -> Tuple[bool, str]:
     tmp = tempfile.NamedTemporaryFile("w", delete=False, suffix=".patch")
     tmp.write(diff_text)
     tmp.close()
     try:
         git("add", "-A")
         run(f"git diff --staged > {shlex.quote(str(PATCH_SNAPSHOT))} || true")
-        # try normal apply
         r = run(f"git apply --reject --whitespace=fix {shlex.quote(tmp.name)}", capture=True)
         if r.returncode != 0:
-            # try 3-way
             r2 = run(f"git apply --3way --reject --whitespace=fix {shlex.quote(tmp.name)}", capture=True)
             if r2.returncode != 0:
                 return False, r2.stdout
@@ -197,6 +202,106 @@ def compare_fail_signal(before_log: str, after_log: str) -> int:
         return s
     return score(after_log) - score(before_log)
 
+# ---------------- self-teaching KB ----------------
+
+def norm_line(s: str) -> str:
+    s = s.strip()
+    # remove timestamps, file paths line numbers, etc
+    s = re.sub(r"/[^\\s:]+(\\.\\w+)+", "<PATH>", s)
+    s = re.sub(r"\\b\\d{1,4}[:;,.]\\d{1,4}\\b", "<NUM>", s)
+    s = re.sub(r"\\b\\d+\\b", "<NUM>", s)
+    return s
+
+def build_error_signature(text: str, max_lines: int = 30) -> Dict[str, Any]:
+    lines = [norm_line(x) for x in (text or "").splitlines() if x.strip()]
+    # take final N lines where errors usually summarize
+    tail = lines[-max_lines:]
+    sig_text = "\n".join(tail)
+    h = hashlib.sha256(sig_text.encode("utf-8")).hexdigest()[:16]
+    return {"hash": h, "preview": "\n".join(tail[:12])}
+
+def kb_load() -> List[Dict[str, Any]]:
+    KB_DIR.mkdir(parents=True, exist_ok=True)
+    if not KB_FILE.exists():
+        return []
+    out = []
+    with KB_FILE.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except Exception:
+                pass
+    return out
+
+def kb_save(entries: List[Dict[str, Any]]) -> None:
+    KB_DIR.mkdir(parents=True, exist_ok=True)
+    with KB_FILE.open("w", encoding="utf-8") as f:
+        for e in entries[-500:]:  # keep last 500
+            f.write(json.dumps(e, ensure_ascii=False) + "\n")
+
+def kb_find_candidate(sig: Dict[str, Any], entries: List[Dict, ]) -> Optional[Dict[str, Any]]:
+    # simple match by hash; if not found, try fuzzy contains in preview
+    for e in reversed(entries):
+        if e.get("sig", {}).get("hash") == sig.get("hash"):
+            return e
+    # fuzzy: overlap some tokens from preview
+    want = set((sig.get("preview") or "").lower().split())
+    if not want:
+        return None
+    best = None
+    best_score = 0
+    for e in reversed(entries):
+        got = set((e.get("sig", {}).get("preview") or "").lower().split())
+        score = len(want & got)
+        if score > best_score and score >= 6:
+            best = e; best_score = score
+    return best
+
+def diff_is_small_and_safe(diff_text: str, max_bytes=120_000, max_files=12) -> bool:
+    if len(diff_text.encode("utf-8")) > max_bytes:
+        return False
+    if diff_touches_dangerous_paths(diff_text):
+        return False
+    files = re.findall(r'^\\+\\+\\+\\s+(?:b/)?(.+)$', diff_text, re.M)
+    if len(files) > max_files:
+        return False
+    return True
+
+def kb_try_apply(sig: Dict[str, Any]) -> bool:
+    entries = kb_load()
+    cand = kb_find_candidate(sig, entries)
+    if not cand:
+        return False
+    diff = cand.get("diff", "")
+    if not diff or not diff_is_small_and_safe(diff):
+        return False
+    print("🧠 KB: trying previously learned patch (id:", cand.get("id", "?"), ")")
+    ok, _ = apply_patch(diff)
+    return ok
+
+def kb_learn(sig: Dict[str, Any], diff: str, project_type: Optional[str] = None) -> None:
+    if not diff or not diff_is_small_and_safe(diff):
+        return
+    entries = kb_load()
+    eid = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ") + "-" + sig["hash"]
+    meta = {
+        "when": datetime.datetime.utcnow().isoformat() + "Z",
+        "project_type": project_type or "",
+        "files": re.findall(r'^\\+\\+\\+\\s+(?:b/)?(.+)$', diff, re.M),
+        "size_bytes": len(diff.encode("utf-8")),
+    }
+    entries.append({"id": eid, "sig": sig, "diff": diff, "meta": meta})
+    kb_save(entries)
+    # leave a short breadcrumb for humans
+    note = TOOLS / "ai_kb" / f"learned_{eid}.txt"
+    note.write_text(
+        f"KB entry {eid}\n\nSignature preview:\n{sig['preview']}\n\nFiles:\n" +
+        "\n".join(meta["files"]), encoding="utf-8"
+    )
+
 # ---------------- LLM providers ----------------
 
 def _call_openai(prompt):
@@ -205,11 +310,7 @@ def _call_openai(prompt):
         raise RuntimeError("openai_error: missing OPENAI_API_KEY")
     import requests
     url = "https://api.openai.com/v1/chat/completions"
-    payload = {
-        "model": OPENAI_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.2,
-    }
+    payload = {"model": OPENAI_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0.2}
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
     r = requests.post(url, headers=headers, json=payload, timeout=180)
     if r.status_code >= 400:
@@ -225,14 +326,7 @@ def _call_llama(prompt):
     if not LLAMA_MODEL_PATH.exists():
         raise RuntimeError(f"llama_error: model missing at {LLAMA_MODEL_PATH}")
     safe = truncate_for_tokens(prompt, MAX_PROMPT_TOKENS)
-    cmd = [
-        LLAMA_CPP_BIN,
-        "-m", str(LLAMA_MODEL_PATH),
-        "-p", safe,
-        "-n", "2048",
-        "--temp", "0.2",
-        "-c", str(LLAMA_CTX),
-    ]
+    cmd = [LLAMA_CPP_BIN, "-m", str(LLAMA_MODEL_PATH), "-p", safe, "-n", "2048", "--temp", "0.2", "-c", str(LLAMA_CTX)]
     out = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     if out.returncode != 0:
         raise RuntimeError("llama_error:" + out.stdout[:500])
@@ -252,25 +346,40 @@ def call_llm(prompt):
     else:
         raise RuntimeError(f"Unknown PROVIDER={PROVIDER}")
 
-# ---------------- Main loop ----------------
+# ---------------- main ----------------
 
 def main():
+    TOOLS.mkdir(parents=True, exist_ok=True)
+    KB_DIR.mkdir(parents=True, exist_ok=True)
     ensure_git_repo()
 
-    # 0) Baseline build (if build.log already exists we still refresh it)
     print(f"== AirysDark-AI builder ==\nProject: {ROOT}\nProvider: {PROVIDER} (fallback: {FALLBACK_PROVIDER})")
     print(f"Build command: {BUILD_CMD}")
+
+    # Baseline build
     base_code = build_once()
     if base_code == 0:
         print("✅ Build already succeeds. Nothing to do.")
         return 0
 
-    before_log_tail = log_tail()
+    before_tail = log_tail()
+    base_sig = build_error_signature(before_tail)
 
+    # 0) Try learned patch first
+    if kb_try_apply(base_sig):
+        print("🧠 KB patch applied. Rebuilding…")
+        code = build_once()
+        if code == 0:
+            print("✅ Fixed by learned patch.")
+            AI_SUMMARY.write_text("Fixed by KB patch\n", encoding="utf-8")
+            return 0
+        else:
+            print("KB patch did not fully fix the build; continuing with AI.")
+            # keep the change (might be partial), proceed
+
+    # 1..N attempts with LLM
     for attempt in range(1, ATTEMPTS + 1):
         print(f"\n== Attempt {attempt}/{ATTEMPTS} ==")
-
-        # 1) Compose prompt
         ctx = PROMPT.format(
             repo_tree=redact(truncate_for_tokens(repo_tree())),
             recent_diff=redact(truncate_for_tokens(recent_diff())),
@@ -280,7 +389,6 @@ def main():
         )
         ctx = truncate_for_tokens(ctx)
 
-        # 2) Ask model
         try:
             raw = call_llm(ctx)
         except Exception as e:
@@ -303,9 +411,7 @@ def main():
                 return 1
             diff = filtered
 
-        # 3) Apply patch
         ok, why = apply_patch(diff)
-        # Log attempt
         with open(AI_ATTEMPTS_LOG, "a", encoding="utf-8") as jf:
             jf.write(json.dumps({
                 "ts": datetime.datetime.utcnow().isoformat() + "Z",
@@ -319,28 +425,23 @@ def main():
             print("Patch apply failed.")
             return 1
 
-        # 4) Rebuild
         code = build_once()
         after_tail = log_tail()
+        delta = compare_fail_signal(before_tail, after_tail)
 
-        # 5) Compare signal
-        delta = compare_fail_signal(before_log_tail, after_tail)
         if code == 0:
             print("✅ Build fixed!")
-            with open(AI_SUMMARY, "w", encoding="utf-8") as f:
-                f.write("Build fixed on attempt %d\n" % attempt)
+            AI_SUMMARY.write_text(f"Build fixed on attempt {attempt}\n", encoding="utf-8")
+            # learn the fix
+            kb_learn(base_sig, diff, project_type=os.getenv("TARGET", ""))
             return 0
         else:
-            # If the new log is "worse", rollback
             if delta > 0:
                 print("⚠️ Build seems worse; rolling back last commit.")
                 git("reset", "--hard", "HEAD~1")
-                # restore previous build log snapshot if we want, but we keep latest for debugging
             else:
-                # keep the change; it might be partial progress
                 pass
-
-        before_log_tail = after_tail
+            before_tail = after_tail
 
     print("❌ Still failing after attempts.")
     return 1
