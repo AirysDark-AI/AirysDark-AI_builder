@@ -6,16 +6,16 @@ Targets supported: **Android, Linux, CMake, Node, Python, Rust, .NET, Maven, Flu
 
 <p align="center">
   <a href="../../actions/workflows/AirysDark-AI_detector.yml">
-    <img alt="Detector status" src="https://img.shields.io/github/actions/workflow/status/${OWNER}/${REPO}/AirysDark-AI_detector.yml?label=Detector">
+    <img alt="Detector status" src="https://img.shields.io/github/actions/workflow/status/AirysDark/${REPO}/AirysDark-AI_detector.yml?label=Detector">
   </a>
   <a href="../../actions/workflows/AirysDark-AI_prob.yml">
-    <img alt="Probe status" src="https://img.shields.io/github/actions/workflow/status/${OWNER}/${REPO}/AirysDark-AI_prob.yml?label=Probe">
+    <img alt="Probe status" src="https://img.shields.io/github/actions/workflow/status/AirysDark/${REPO}/AirysDark-AI_prob.yml?label=Probe">
   </a>
   <a href="../../actions/workflows/AirysDark-AI_build.yml">
-    <img alt="Build status" src="https://img.shields.io/github/actions/workflow/status/${OWNER}/${REPO}/AirysDark-AI_build.yml?label=Build">
+    <img alt="Build status" src="https://img.shields.io/github/actions/workflow/status/AirysDark/${REPO}/AirysDark-AI_build.yml?label=Build">
   </a>
   <a href="../../actions/workflows/AirysDark-AI_android.yml">
-    <img alt="Android status" src="https://img.shields.io/github/actions/workflow/status/${OWNER}/${REPO}/AirysDark-AI_android.yml?label=Android">
+    <img alt="Android status" src="https://img.shields.io/github/actions/workflow/status/AirysDark/${REPO}/AirysDark-AI_android.yml?label=Android">
   </a>
 </p>
 
