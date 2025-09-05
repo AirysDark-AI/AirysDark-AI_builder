@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-# AirysDark-AI_detector.py
+# AirysDark-AI_detector.py (safe YAML: quoted 'on', quoted '**', block-style with:)
 #
 # Detects build types by scanning the entire repo (all subfolders/files).
-# Adds:
+# Extras:
 #   - Folder-name hints (linux / android / windows)
 #   - CMakeLists.txt content inspection (flags linux when desktop-ish)
 #
@@ -10,12 +10,12 @@
 #   .github/workflows/AirysDark-AI_prob_<type>.yml
 #
 # Each PROBE workflow:
-#   - Fetches tools from AirysDark-AI/AirysDark-AI_builder (detector, probe, builder)
+#   - Fetches tools (detector, probe, builder) from AirysDark-AI/AirysDark-AI_builder
 #   - Runs AirysDark-AI_probe.py to compute BUILD_CMD
 #   - Writes the final AI workflow .github/workflows/AirysDark-AI_<type>.yml (heredoc)
-#   - Uses peter-evans/create-pull-request with secrets.BOT_TOKEN
-#   - checkout uses block-style `with:` (no inline maps) and persist-credentials: false
-#   - Pins git remote with BOT_TOKEN right before PR steps
+#   - Pins git remote then opens PRs with peter-evans/create-pull-request using secrets.BOT_TOKEN
+#
+# Types: android, cmake, linux, node, python, rust, dotnet, maven, flutter, go, bazel, scons, ninja, unknown
 
 import os
 import pathlib
@@ -56,12 +56,12 @@ def collect_dir_name_hints(files):
 
 # ---------- CMake classifier ----------
 ANDROID_HINTS = (
-    "android","android_abi","android_platform","ndk","cmake_android","gradle",
-    "externalnativebuild","find_library(log)","log-lib","loglib"
+    "android", "android_abi", "android_platform", "ndk", "cmake_android",
+    "gradle", "externalnativebuild", "find_library(log)", "log-lib", "loglib",
 )
 DESKTOP_HINTS = (
-    "add_executable","pkgconfig","find_package(","threads","pthread","x11",
-    "wayland","gtk","qt","set(cmake_system_name linux"
+    "add_executable", "pkgconfig", "find_package(", "threads", "pthread",
+    "x11", "wayland", "gtk", "qt", "set(cmake_system_name linux",
 )
 
 def cmakelists_flavor(cm_txt: str) -> str:
@@ -110,8 +110,8 @@ def detect_types():
     if "pom.xml" in fnames and "maven" not in types: types.append("maven")
     if "pubspec.yaml" in fnames and "flutter" not in types: types.append("flutter")
     if "go.mod" in fnames and "go" not in types: types.append("go")
-    if any(n in ("workspace","workspace.bazel","module.bazel") for n in fnames) or \
-       any(os.path.basename(r) in ("build","build.bazel") for r in rels):
+    if any(n in ("workspace", "workspace.bazel", "module.bazel") for n in fnames) or \
+       any(os.path.basename(r) in ("build", "build.bazel") for r in rels):
         if "bazel" not in types: types.append("bazel")
     if "sconstruct" in fnames or "sconscript" in fnames:
         if "scons" not in types: types.append("scons")
@@ -127,7 +127,7 @@ def detect_types():
             out.append(t)
     return out
 
-# ---------- Type-specific setup blocks (block-style YAML only) ----------
+# ---------- Type-specific setup blocks ----------
 def setup_steps_inline(ptype: str) -> str:
     if ptype == "android":
         return textwrap.dedent("""
@@ -230,11 +230,11 @@ def write_probe_workflow_for_type(ptype: str):
     tmpl = r"""
 name: AirysDark-AI - Probe __PTYPE_CAP__
 
-on:
+'on':
   workflow_dispatch: {}
   push:
     branches:
-      - "**"
+      - '**'
   pull_request: {}
 
 permissions:
@@ -285,11 +285,11 @@ __SETUP_INLINE__
           cat > .github/workflows/AirysDark-AI___PTYPE__.yml <<'YAML'
           name: AirysDark-AI - __PTYPE_CAP__ (generated)
 
-          on:
+          'on':
             workflow_dispatch: {}
             push:
               branches:
-                - "**"
+                - '**'
             pull_request: {}
 
           jobs:
@@ -462,27 +462,21 @@ __SETUP_INLINE__
             .replace("__PTYPE_CAP__", ptype.capitalize())
             )
 
-    # inject pin-remote after checkout (probe job)
-    yaml = yaml.replace(
-        "- uses: actions/checkout@v4\n        with:\n          fetch-depth: 0\n          persist-credentials: false\n",
-        "- uses: actions/checkout@v4\n        with:\n          fetch-depth: 0\n          persist-credentials: false\n" + textwrap.indent(PIN_REMOTE_YAML, ""))
-    yaml = yaml.replace("__SETUP_INLINE__", setup_block.rstrip("\n"))
-
     (WF / f"AirysDark-AI_prob_{ptype}.yml").write_text(yaml)
     print(f"✅ Generated: AirysDark-AI_prob_{ptype}.yml")
 
-# ---------- Android-specific PROBE writer (kept explicit) ----------
+# ---------- Android-specific PROBE writer ----------
 def write_probe_workflow_for_android():
     setup_inline = setup_steps_inline("android")
 
     tmpl = r"""
 name: AirysDark-AI - Probe Android
 
-on:
+'on':
   workflow_dispatch: {}
   push:
     branches:
-      - "**"
+      - '**'
   pull_request: {}
 
 permissions:
@@ -533,11 +527,11 @@ __SETUP_INLINE__
           cat > .github/workflows/AirysDark-AI_android.yml <<'YAML'
           name: AirysDark-AI - Android (generated)
 
-          on:
+          'on':
             workflow_dispatch: {}
             push:
               branches:
-                - "**"
+                - '**'
             pull_request: {}
 
           jobs:
