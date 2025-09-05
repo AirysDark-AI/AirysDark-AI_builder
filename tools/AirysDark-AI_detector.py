@@ -228,8 +228,11 @@ def write_probe_workflow_for_type(ptype: str):
 name: AirysDark-AI — Probe __PTYPE_CAP__
 
 on:
-  workflow_dispatch: {}
-  push: { branches: ["**"] }
+  workflow_dispatch:
+  push:
+    branches:
+      - "**"
+  pull_request:
 
 permissions:
   contents: write
@@ -277,9 +280,11 @@ __SETUP_INLINE__
           name: AirysDark-AI — __PTYPE_CAP__ (generated)
 
           on:
-            workflow_dispatch: {}
-            push: { branches: ["**"] }
-            pull_request: {}
+            workflow_dispatch:
+            push:
+              branches:
+                - "**"
+            pull_request:
 
           jobs:
             build:
@@ -448,7 +453,7 @@ __SETUP_INLINE__
             .replace("__PTYPE_CAP__", ptype.capitalize())
             )
 
-    # inject pin-remote where requested
+    # inject pin-remote after checkout
     yaml = yaml.replace(
         "      - uses: actions/checkout@v4\n        with: { fetch-depth: 0, persist-credentials: false }\n",
         "      - uses: actions/checkout@v4\n        with: { fetch-depth: 0, persist-credentials: false }\n" + textwrap.indent(PIN_REMOTE_YAML, ""))
