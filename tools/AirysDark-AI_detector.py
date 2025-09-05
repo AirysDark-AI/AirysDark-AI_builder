@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
-# AirysDark-AI_detector.py — DETECT ONLY (generates a single PROB workflow)
+# AirysDark-AI_detector.py — DETECT ONLY
 #
-# - Deep scans the repo (every folder/file; skips .git)
-# - Classifies: android, linux, cmake, node, python, rust, dotnet, maven, flutter, go, bazel, scons, unknown
-# - Writes artifacts for probe use (tools/*)
+# - Deep scans repo (all dirs; skips .git)
+# - Decides build types: android, linux, cmake, node, python, rust, dotnet, maven, flutter, go, bazel, scons, unknown
+# - Writes logs + JSONs under tools/
 # - Generates exactly ONE workflow: .github/workflows/AirysDark-AI_prob.yml
-#   This workflow:
-#     * is manual (workflow_dispatch with a required "target" input)
-#     * FIRST runs tools/AirysDark-AI_prob.py to create rich repo reports
-#     * THEN runs the per-target probe step (Android is live; others are stubs)
-#
+#   • The workflow *does not* fetch tools; it assumes this detector PR added them
+#   • The workflow requires manual edit: env: TARGET must be set by the user before running
+
 import os, json, pathlib, datetime
 
 ROOT  = pathlib.Path(os.getenv("PROJECT_DIR", ".")).resolve()
@@ -18,7 +16,6 @@ WF    = ROOT / ".github" / "workflows"
 TOOLS.mkdir(parents=True, exist_ok=True)
 WF.mkdir(parents=True, exist_ok=True)
 
-# ---- CMake flavor classifier ----
 ANDROID_HINTS = (
     "android", "android_abi", "android_platform", "ndk", "cmake_android",
     "gradle", "externalnativebuild", "find_library(log)", "log-lib", "loglib"
@@ -29,10 +26,8 @@ DESKTOP_HINTS = (
 )
 
 def read_text_safe(p: pathlib.Path) -> str:
-    try:
-        return p.read_text(errors="ignore")
-    except Exception:
-        return ""
+    try: return p.read_text(errors="ignore")
+    except Exception: return ""
 
 def cmakelists_flavor(cm_txt: str) -> str:
     t = cm_txt.lower()
@@ -41,20 +36,10 @@ def cmakelists_flavor(cm_txt: str) -> str:
     return "desktop"
 
 def deep_scan():
-    hits = {
-        "android_gradle": [],  # gradlew / build.gradle* / settings.gradle*
-        "cmakelists": [],
-        "make_like": [],       # Makefile / meson.build / build.ninja / *.mk
-        "node": [],
-        "python": [],
-        "rust": [],
-        "dotnet": [],
-        "maven": [],
-        "flutter": [],
-        "go": [],
-        "bazel": [],
-        "scons": [],
-    }
+    hits = {k: [] for k in [
+        "android_gradle","cmakelists","make_like","node","python","rust",
+        "dotnet","maven","flutter","go","bazel","scons"
+    ]}
     cmake_flavors = []
     folder_hints = set()
 
@@ -62,8 +47,7 @@ def deep_scan():
         if ".git" in dirs: dirs.remove(".git")
         r = pathlib.Path(root)
         for part in r.relative_to(ROOT).parts:
-            if part:
-                folder_hints.add(part.lower())
+            if part: folder_hints.add(part.lower())
         for fn in files:
             low = fn.lower()
             rel = (r / fn).relative_to(ROOT)
@@ -93,49 +77,32 @@ def deep_scan():
             if low in ("sconstruct","sconscript"):
                 hits["scons"].append(str(rel))
 
-    # Folder-name hints
-    if "android" in folder_hints:
-        hits["android_gradle"].append("folder-hint:android")
-    if "linux" in folder_hints:
-        hits["make_like"].append("folder-hint:linux")
+    if "android" in folder_hints: hits["android_gradle"].append("folder-hint:android")
+    if "linux"   in folder_hints: hits["make_like"].append("folder-hint:linux")
 
     return hits, cmake_flavors, sorted(folder_hints)
 
 def decide_types(hits, cmake_flavors):
     types = set()
-    if hits["android_gradle"]:
-        types.add("android")
+    if hits["android_gradle"]: types.add("android")
     if hits["cmakelists"]:
         types.add("cmake")
-        if any(x["flavor"] == "desktop" for x in cmake_flavors):
-            types.add("linux")
-    if hits["make_like"]:
-        types.add("linux")
-    if hits["node"]:
-        types.add("node")
-    if hits["python"]:
-        types.add("python")
-    if hits["rust"]:
-        types.add("rust")
-    if hits["dotnet"]:
-        types.add("dotnet")
-    if hits["maven"]:
-        types.add("maven")
-    if hits["flutter"]:
-        types.add("flutter")
-    if hits["go"]:
-        types.add("go")
-    if hits["bazel"]:
-        types.add("bazel")
-    if hits["scons"]:
-        types.add("scons")
-    if not types:
-        types.add("unknown")
+        if any(x["flavor"] == "desktop" for x in cmake_flavors): types.add("linux")
+    if hits["make_like"]: types.add("linux")
+    if hits["node"]:      types.add("node")
+    if hits["python"]:    types.add("python")
+    if hits["rust"]:      types.add("rust")
+    if hits["dotnet"]:    types.add("dotnet")
+    if hits["maven"]:     types.add("maven")
+    if hits["flutter"]:   types.add("flutter")
+    if hits["go"]:        types.add("go")
+    if hits["bazel"]:     types.add("bazel")
+    if hits["scons"]:     types.add("scons")
+    if not types:         types.add("unknown")
     order = ["android","linux","cmake","node","python","rust","dotnet","maven","flutter","go","bazel","scons","unknown"]
     return [t for t in order if t in types]
 
 def write_artifacts(hits, cmake_flavors, folder_hints, types):
-    # human summary for PR body
     summary = []
     summary.append(f"[{datetime.datetime.utcnow().isoformat()}Z] AirysDark-AI detector scan")
     summary.append("Detected build types: " + ", ".join(types))
@@ -155,6 +122,7 @@ def write_artifacts(hits, cmake_flavors, folder_hints, types):
     add("Go projects", "go")
     add("Bazel signals", "bazel")
     add("SCons signals", "scons")
+
     log = summary[:] + ["", "Detailed file hits:"]
     for k, arr in hits.items():
         if arr:
@@ -176,38 +144,29 @@ def write_artifacts(hits, cmake_flavors, folder_hints, types):
         "cmake_flavors": cmake_flavors,
         "folder_hints": folder_hints,
     }, indent=2))
-    (TOOLS / "airysdark_ai_probe_inputs.json").write_text(json.dumps({
-        "types": types,
-        "android_gradle_paths": hits["android_gradle"][:200],
-        "cmakelists_paths": hits["cmakelists"][:200],
-        "make_like_paths": hits["make_like"][:200],
-    }, indent=2))
 
 def generate_prob_workflow(types):
-    # Choices in order, default is the first
-    choices = types[:] or ["unknown"]
-    default_choice = choices[0]
+    # Create a probe workflow that REQUIRES manual edit of env: TARGET
+    # (no auto-run on PR; user must set TARGET to android/linux/cmake/etc)
+    valid = types[:] or ["unknown"]
+    valid_list = ", ".join(valid)
 
     yml = f"""
 name: AirysDark-AI - Probe
 
 on:
-  workflow_dispatch:
-    inputs:
-      target:
-        description: "Which build type to probe (pick before running)"
-        required: true
-        type: choice
-        options: [{", ".join(choices)}]
-        default: {default_choice}
+  workflow_dispatch: {{}}
 
 permissions:
   contents: write
   pull-requests: write
 
-concurrency:
-  group: ${{{{ github.workflow }}}}-${{{{{ github.ref }}}}}
-  cancel-in-progress: true
+# >>> IMPORTANT <<<
+# You MUST manually set TARGET below to one of:
+#   {valid_list}
+# The workflow will do nothing until you change TARGET from __SET_ME__.
+env:
+  TARGET: __SET_ME__   # e.g., android / linux / cmake / node / python / ...
 
 jobs:
   probe:
@@ -229,7 +188,7 @@ jobs:
           set -euxo pipefail
           test -f tools/AirysDark-AI_prob.py
           test -f tools/AirysDark-AI_builder.py
-          if [ "${{{{ github.event.inputs.target }}}}" = "android" ]; then
+          if [ "${{{{ env.TARGET }}}}" = "android" ]; then
             test -f tools/AirysDark-AI_android.py
           fi
           ls -la tools
@@ -239,11 +198,7 @@ jobs:
         run: |
           set -euxo pipefail
           python3 tools/AirysDark-AI_prob.py
-          if [ -f tools/airysdark_ai_prob_report.json ]; then
-            echo "PROB_JSON=ok" >> "$GITHUB_OUTPUT"
-          else
-            echo "PROB_JSON=missing" >> "$GITHUB_OUTPUT"
-          fi
+          echo "Probe completed. TARGET=${{{{ env.TARGET }}}}"
 
       - name: Upload probe report (JSON + LOG)
         if: always()
@@ -257,79 +212,18 @@ jobs:
           retention-days: 7
 
       # ===== Android (live) =====
-      - name: Probe → Plan Android workflow (AI-assisted)
-        if: ${{{{ github.event.inputs.target == 'android' }}}}
-        id: probe_android
+      - name: Plan Android workflow (AI-assisted)
+        if: ${{{{ env.TARGET == 'android' }}}}
         run: |
           set -euxo pipefail
-          python3 tools/AirysDark-AI_android.py --mode probe-ai | tee /tmp/android_plan.out
-          if grep -E '^BUILD_CMD=' /tmp/android_plan.out >/dev/null; then
-            CMD=$(grep -E '^BUILD_CMD=' /tmp/android_plan.out | sed 's/^BUILD_CMD=//')
-            echo "BUILD_CMD=$CMD" >> "$GITHUB_OUTPUT"
-          fi
+          python3 tools/AirysDark-AI_android.py --mode probe-ai
 
-      # ===== Stubs (safe placeholders) =====
-      - name: Probe Linux (stub)
-        if: ${{{{ github.event.inputs.target == 'linux' }}}}
+      # ===== Stubs =====
+      - name: Target not set (no-op)
+        if: ${{{{ env.TARGET == '__SET_ME__' }}}}
         run: |
-          echo "TODO: add tools/AirysDark-AI_linux.py to generate final Linux workflow PR."
-          echo "Suggested baseline: make -C linux -j || make -j"
-
-      - name: Probe CMake (stub)
-        if: ${{{{ github.event.inputs.target == 'cmake' }}}}
-        run: |
-          echo "TODO: add tools/AirysDark-AI_cmake.py to generate final CMake workflow PR."
-          echo "Suggested baseline: cmake -S . -B build && cmake --build build -j"
-
-      - name: Probe Node (stub)
-        if: ${{{{ github.event.inputs.target == 'node' }}}}
-        run: |
-          echo "TODO: add tools/AirysDark-AI_node.py."
-
-      - name: Probe Python (stub)
-        if: ${{{{ github.event.inputs.target == 'python' }}}}
-        run: |
-          echo "TODO: add tools/AirysDark-AI_python.py."
-
-      - name: Probe Rust (stub)
-        if: ${{{{ github.event.inputs.target == 'rust' }}}}
-        run: |
-          echo "TODO: add tools/AirysDark-AI_rust.py."
-
-      - name: Probe .NET (stub)
-        if: ${{{{ github.event.inputs.target == 'dotnet' }}}}
-        run: |
-          echo "TODO: add tools/AirysDark-AI_dotnet.py."
-
-      - name: Probe Maven (stub)
-        if: ${{{{ github.event.inputs.target == 'maven' }}}}
-        run: |
-          echo "TODO: add tools/AirysDark-AI_maven.py."
-
-      - name: Probe Flutter (stub)
-        if: ${{{{ github.event.inputs.target == 'flutter' }}}}
-        run: |
-          echo "TODO: add tools/AirysDark-AI_flutter.py."
-
-      - name: Probe Go (stub)
-        if: ${{{{ github.event.inputs.target == 'go' }}}}
-        run: |
-          echo "TODO: add tools/AirysDark-AI_go.py."
-
-      - name: Probe Bazel (stub)
-        if: ${{{{ github.event.inputs.target == 'bazel' }}}}
-        run: |
-          echo "TODO: add tools/AirysDark-AI_bazel.py."
-
-      - name: Probe SCons (stub)
-        if: ${{{{ github.event.inputs.target == 'scons' }}}}
-        run: |
-          echo "TODO: add tools/AirysDark-AI_scons.py."
-
-      - name: Probe Unknown (stub)
-        if: ${{{{ github.event.inputs.target == 'unknown' }}}}
-        run: |
-          echo "No known build system detected. Keep iterating with the detector and handlers."
+          echo "TARGET is '__SET_ME__'. Edit .github/workflows/AirysDark-AI_prob.yml and set env: TARGET to a valid value."
+          echo "Valid: {valid_list}"
 """.lstrip("\n")
 
     (WF / "AirysDark-AI_prob.yml").write_text(yml)

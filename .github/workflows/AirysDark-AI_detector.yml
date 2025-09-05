@@ -12,27 +12,30 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout (no credentials)
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Fetch AirysDark-AI tools (ONLY HERE)
+      - name: Fetch tools.tar (ONLY here)
         run: |
           set -euxo pipefail
           mkdir -p tools
-          BASE_URL="https://raw.githubusercontent.com/AirysDark-AI/AirysDark-AI_builder/main/tools"
-          curl -fL "$BASE_URL/AirysDark-AI_detector.py" -o tools/AirysDark-AI_detector.py
-          curl -fL "$BASE_URL/AirysDark-AI_android.py"  -o tools/AirysDark-AI_android.py
-          curl -fL "$BASE_URL/AirysDark-AI_builder.py"  -o tools/AirysDark-AI_builder.py
+          # Use the RAW URL for the tarball
+          curl -fL "https://raw.githubusercontent.com/AirysDark-AI/AirysDark-AI_builder/main/tools/tools.tar" -o /tmp/tools.tar
+          tar -xvf /tmp/tools.tar -C tools
           ls -la tools
 
-      - name: Run detector (writes a single PROB workflow)
-        run: python3 tools/AirysDark-AI_detector.py
+      - name: Run detector (generates AirysDark-AI_prob.yml + logs)
+        run: |
+          set -euxo pipefail
+          python3 tools/AirysDark-AI_detector.py
 
       - name: Stage detector outputs
         id: diff
@@ -45,25 +48,32 @@ jobs:
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Prepare PR body
+      - name: Prepare PR body (summary + notes)
         if: ${{ steps.diff.outputs.changed == 'true' }}
         run: |
-          echo "### AirysDark-AI detector results" > pr_body.md
+          set -euxo pipefail
+          echo "### AirysDark-AI: detector results" > pr_body.md
           echo "" >> pr_body.md
-          echo '```' >> pr_body.md
-          cat tools/airysdark_ai_detector_summary.txt >> pr_body.md
-          echo '```' >> pr_body.md
+          if [ -f tools/airysdark_ai_detector_summary.txt ]; then
+            echo '```' >> pr_body.md
+            cat tools/airysdark_ai_detector_summary.txt >> pr_body.md
+            echo '```' >> pr_body.md
+          else
+            echo "_No detector summary found._" >> pr_body.md
+          fi
           echo "" >> pr_body.md
-          echo "This PR adds:" >> pr_body.md
-          echo "- tools/*.py (detector, android handler, builder)" >> pr_body.md
-          echo "- .github/workflows/AirysDark-AI_prob.yml (single manual probe workflow)" >> pr_body.md
+          echo "**Next steps:**" >> pr_body.md
+          echo "1. Edit \`.github/workflows/AirysDark-AI_prob.yml\` and set **env: TARGET** to the build you want to pursue (e.g. \`android\`, \`linux\`, \`cmake\`)." >> pr_body.md
+          echo "2. Merge this PR." >> pr_body.md
+          echo "3. Manually run the workflow **AirysDark-AI - Probe** from the Actions tab." >> pr_body.md
           echo "" >> pr_body.md
-          echo "After merging: run **AirysDark-AI – Probe** and select the target build type." >> pr_body.md
+          echo "_Note: Only this detector workflow fetches tools. The generated probe workflow does not download anything._" >> pr_body.md
 
-      - name: Pin remote with FG-PAT
+      # Configure remote to use a Fine-grained PAT (recommended)
+      - name: Configure remote for FG-PAT
         if: ${{ steps.diff.outputs.changed == 'true' }}
         env:
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}   # Fine-grained PAT with repo:contents & PRs
           REPO_SLUG: ${{ github.repository }}
         run: |
           set -euxo pipefail
