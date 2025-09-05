@@ -1,117 +1,111 @@
 #!/usr/bin/env python3
 """
-AirysDark-AI_probe.py
-Figures out the most likely build command for a given project type,
-so the workflow can run the *right* command before invoking the AI fixer.
+AirysDark-AI_probe.py — smarter build-command prober
 
-Usage (GitHub Actions):
-  - name: Probe build command
-    id: probe
-    run: |
-      python3 tools/AirysDark-AI_probe.py --type "${{ matrix.type || inputs.type || 'linux' }}"
+Outputs a single line for GitHub Actions:
+  BUILD_CMD=<the command to run>
+
+Covers: android, cmake, linux, node, python, rust, dotnet, maven, flutter, go,
+        bazel, scons, ninja, unknown
 """
 
-import argparse, os, re, subprocess, sys, shlex
+import argparse, os, re, shlex, subprocess, sys
 from pathlib import Path
-from typing import Iterable, List, Tuple
 
 ROOT = Path(".").resolve()
 
-def sh(cmd: str, cwd: Path | None = None, check: bool = False) -> tuple[str, int]:
-    p = subprocess.run(cmd, cwd=cwd, shell=True, text=True,
-                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+# ---------------- Utilities ----------------
+def sh(cmd, cwd=None, check=False):
+    p = subprocess.run(
+        cmd, cwd=cwd, shell=True, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+    )
     if check and p.returncode != 0:
         raise subprocess.CalledProcessError(p.returncode, cmd, output=p.stdout)
     return p.stdout, p.returncode
 
-def scan_all_files() -> List[Tuple[Path, Path, str]]:
-    out: List[Tuple[Path, Path, str]] = []
-    for root, dirs, files in os.walk(ROOT):
-        if ".git" in dirs:
-            dirs.remove(".git")
-        for fn in files:
-            ap = Path(root) / fn
-            try:
-                rp = ap.relative_to(ROOT)
-            except Exception:
-                rp = ap
-            out.append((ap, rp, fn.lower()))
-    return out
-
-def find_first(globs: Iterable[str]) -> Path | None:
-    for pat in globs:
-        for p in ROOT.glob(pat):
-            return p
-    return None
-
-def print_output_var(name: str, val: str):
+def print_output_var(name, val):
     print(f"{name}={val}")
 
-# ---------------- Android ----------------
-def probe_android() -> str:
+def find_all(globs):
+    out = []
+    for g in globs:
+        out.extend(ROOT.glob(g))
+    # de-dup but keep order
+    seen, dedup = set(), []
+    for p in out:
+        if p not in seen:
+            dedup.append(p)
+            seen.add(p)
+    return dedup
+
+def find_first(globs):
+    for p in find_all(globs):
+        return p
+    return None
+
+def count_sources(dir_path: Path):
+    exts = (".c", ".cc", ".cpp", ".cxx", ".h", ".hpp")
+    n = 0
+    for p in dir_path.rglob("*"):
+        if p.suffix.lower() in exts:
+            n += 1
+    return n
+
+# ---------------- Android (Gradle) ----------------
+def parse_settings_modules(settings_path: Path):
     """
-    Strategy:
-      1) find gradlew(s) anywhere
-      2) pick the wrapper whose directory has a settings.gradle(.kts)
-      3) parse settings for modules; prefer :app
-      4) ask Gradle for tasks; prefer assemble/bundle (Debug → Release → build)
+    Parse settings.gradle(.kts) and extract included modules like ':app', ':feature:home'.
     """
-    wrappers = list(ROOT.glob("**/gradlew"))
-    if not wrappers and (ROOT / "gradlew").exists():
-        wrappers = [ROOT / "gradlew"]
-    if not wrappers:
-        # fallback
-        return "./gradlew assembleDebug --stacktrace"
+    if not settings_path or not settings_path.exists():
+        return []
+    txt = settings_path.read_text(errors="ignore")
+    # Groovy/KTS variants:
+    # include(':app', ':lib'); include(":feature:home")
+    # include ':app', ':lib'
+    mods = []
 
-    # rank wrappers: prefer one with settings + app module present
-    def parse_modules(settings: Path) -> list[str]:
-        if not settings or not settings.exists():
-            return []
-        txt = settings.read_text(errors="ignore")
-        # include(":app", ":feature:home")
-        mods: list[str] = []
-        for m in re.findall(r'include\s*\((.*?)\)', txt, flags=re.S):
-            parts = re.split(r'[,\s]+', m.strip())
-            for p in parts:
-                p = p.strip().strip('"\'')
+    # include(...) style
+    for raw in re.findall(r'include\s*\((.*?)\)', txt, flags=re.S):
+        for part in re.split(r'[, \n\t]+', raw.strip()):
+            part = part.strip().strip('"\'')
+            if part.startswith(":"):
+                mods.append(part[1:])
 
-                if p.startswith(":"):
-                    mods.append(p[1:])
-        # include ':app', ':lib'
-        for m in re.findall(r'include\s+([^\n]+)', txt, flags=re.I):
-            for p in re.split(r'[, \t]+', m.strip()):
-                p = p.strip().strip('"\'')
+    # include ':a', ':b' style (no parentheses)
+    # capture lines like: include ':app', ':lib'
+    for line in txt.splitlines():
+        m = re.match(r'\s*include\s+(.+)', line)
+        if m:
+            payload = m.group(1)
+            for part in re.split(r'[, \s]+', payload.strip()):
+                part = part.strip().strip('"\'')
+                if part.startswith(":"):
+                    mods.append(part[1:])
 
-                if p.startswith(":"):
-                    mods.append(p[1:])
-        # unique, preserve order
-        seen, out = set(), []
-        for mm in mods:
-            if mm and mm not in seen:
-                seen.add(mm)
-                out.append(mm)
-        return out
+    # unique keep-order
+    seen, order = set(), []
+    for m in mods:
+        if m and m not in seen:
+            seen.add(m)
+            order.append(m)
+    return order
 
-    def has_app_module(basedir: Path, modules: list[str]) -> bool:
-        for m in modules:
-            for buildfile in ("build.gradle", "build.gradle.kts"):
-                f = basedir / m.replace(":", "/") / buildfile
-                if f.exists():
-                    t = f.read_text(errors="ignore").lower()
-                    if "com.android.application" in t:
-                        return True
-        # common guesses
-        for guess in ("app", "mobile", "android"):
-            for buildfile in ("build.gradle", "build.gradle.kts"):
-                f = basedir / guess / buildfile
-                if f.exists():
-                    t = f.read_text(errors="ignore").lower()
-                    if "com.android.application" in t:
-                        return True
-        return False
+def module_is_android_app(root_dir: Path, module_name: str) -> bool:
+    # translate module like "app" or "feature:home" -> path "feature/home"
+    mod_path = root_dir / module_name.replace(":", "/")
+    for fname in ("build.gradle", "build.gradle.kts"):
+        f = mod_path / fname
+        if f.exists():
+            t = f.read_text(errors="ignore")
+            if "com.android.application" in t:
+                return True
+    return False
 
-    ranked: list[tuple[Path,bool,bool,list[str]]] = []
-    for g in wrappers:
+def pick_best_gradlew():
+    # prefer root gradlew, else the one whose dir has settings + app module
+    candidates = []
+    for g in find_all(["gradlew", "**/gradlew"]):
         d = g.parent
         settings = None
         for s in ("settings.gradle", "settings.gradle.kts"):
@@ -119,109 +113,167 @@ def probe_android() -> str:
             if sp.exists():
                 settings = sp
                 break
-        modules = parse_modules(settings) if settings else []
-        ranked.append((g, settings is not None, has_app_module(d, modules), modules))
+        modules = parse_settings_modules(settings) if settings else []
+        has_app = any(module_is_android_app(d, m) for m in modules)
+        candidates.append((g, settings is not None, has_app, modules))
 
-    ranked.sort(key=lambda x: (not x[1], not x[2]))  # settings, then app module
-    g, _, _, modules = ranked[0]
+    if not candidates:
+        return None, None, []
+
+    # sort: settings present & has_app first, root-most path next (shortest parts)
+    candidates.sort(key=lambda x: (not x[1], not x[2], len(x[0].parts)))
+    g, _, _, modules = candidates[0]
     try:
         g.chmod(0o755)
     except Exception:
         pass
+    return g, g.parent, modules
+
+def probe_android():
+    g, gdir, modules = pick_best_gradlew()
+    if not g:
+        # no wrapper found, generic attempt
+        return "./gradlew assembleDebug --stacktrace"
 
     # query tasks
-    tasks_out, _ = sh(f"./{g.name} -q tasks --all", cwd=g.parent)
+    out, _ = sh(f"./{g.name} -q tasks --all", cwd=gdir)
+    def task_exists(t):
+        return re.search(rf"(^|\s){re.escape(t)}(\s|$)", out) is not None
 
-    def exists_task(name: str) -> bool:
-        return re.search(rf"(^|\s){re.escape(name)}(\s|$)", tasks_out) is not None
-
-    # candidates
-    base = ["assembleDebug", "bundleDebug", "assembleRelease", "bundleRelease", "build"]
-    module_candidates: list[str] = []
+    # ranked tasks (plain then module-specific)
+    base_tasks = ["assembleDebug", "bundleDebug", "assembleRelease", "bundleRelease", "build"]
+    module_tasks = []
+    # prefer real app modules from settings
     for m in modules:
-        module_candidates += [f":{m}:{t}" for t in base]
-    for guess in ("app", "mobile", "android"):
-        module_candidates += [f":{guess}:{t}" for t in base]
+        if module_is_android_app(gdir, m):
+            for t in ("assembleDebug","bundleDebug","assembleRelease","bundleRelease"):
+                module_tasks.append(f":{m}:{t}")
+    # common guesses
+    for guess in ("app","mobile","android"):
+        for t in ("assembleDebug","bundleDebug","assembleRelease","bundleRelease"):
+            module_tasks.append(f":{guess}:{t}")
 
-    for t in base:
-        if exists_task(t):
-            return f'cd {shlex.quote(str(g.parent))} && ./gradlew {t} --stacktrace'
-    for t in module_candidates:
-        if exists_task(t):
-            return f'cd {shlex.quote(str(g.parent))} && ./gradlew {t} --stacktrace'
-
-    # last resort
-    return f'cd {shlex.quote(str(g.parent))} && ./gradlew assembleDebug --stacktrace'
+    for t in base_tasks:
+        if task_exists(t):
+            return f'cd {shlex.quote(str(gdir))} && ./gradlew {t} --stacktrace'
+    for t in module_tasks:
+        if task_exists(t):
+            return f'cd {shlex.quote(str(gdir))} && ./gradlew {t} --stacktrace'
+    # final fallback
+    return f'cd {shlex.quote(str(gdir))} && ./gradlew assembleDebug --stacktrace'
 
 # ---------------- CMake ----------------
-def probe_cmake() -> str:
-    if (ROOT / "CMakeLists.txt").exists():
-        return "cmake -S . -B build && cmake --build build -j"
-    first = find_first(["**/CMakeLists.txt"])
-    if first:
-        outdir = f'build/{str(first.parent).replace("/", "_")}'
-        return f'cmake -S "{first.parent}" -B "{outdir}" && cmake --build "{outdir}" -j'
-    return "echo 'No CMakeLists.txt found' && exit 1"
+def score_cmakelists(cmake_file: Path):
+    txt = cmake_file.read_text(errors="ignore").lower()
+    score = 0
+    for kw in ("project(", "add_executable(", "find_package(", "add_library("):
+        if kw in txt:
+            score += 2
+    score += min(50, count_sources(cmake_file.parent))  # proximity to sources helps
+    # slightly prefer top-level (short path)
+    score += max(0, 10 - len(cmake_file.parts))
+    return score
+
+def probe_cmake():
+    cmakes = find_all(["CMakeLists.txt", "**/CMakeLists.txt"])
+    if not cmakes:
+        return "echo 'No CMakeLists.txt found' && exit 1"
+    # choose best scoring one
+    best = max(cmakes, key=score_cmakelists)
+    d = best.parent
+    outdir = f'build/{str(d.relative_to(ROOT)).replace("/", "_")}'
+    return f'cmake -S "{d}" -B "{outdir}" && cmake --build "{outdir}" -j'
 
 # ---------------- Linux (Make/Meson/Ninja) ----------------
-def probe_linux() -> str:
-    # simple Makefile root
-    if (ROOT / "Makefile").exists():
-        return "make -j"
-    mk = find_first(["**/Makefile"])
+def probe_linux():
+    mk = find_all(["Makefile", "**/Makefile"])
     if mk:
-        return f'make -C "{mk.parent}" -j'
-    # Meson/Ninja
-    if (ROOT / "meson.build").exists():
-        return "(meson setup build --wipe || true); meson setup build || true; ninja -C build"
-    mb = find_first(["**/meson.build"])
+        # pick the Makefile closest to repo root (shortest path)
+        mk.sort(key=lambda p: len(p.parts))
+        return f'make -C "{mk[0].parent}" -j'
+    mb = find_all(["meson.build", "**/meson.build"])
     if mb:
-        d = mb.parent
+        # pick meson closest to root
+        mb.sort(key=lambda p: len(p.parts))
+        d = mb[0].parent
         return f'(cd "{d}" && (meson setup build --wipe || true); meson setup build || true; ninja -C build)'
-    # Raw Ninja
-    if (ROOT / "build.ninja").exists():
-        return "ninja"
-    bn = find_first(["**/build.ninja"])
+    bn = find_all(["build.ninja", "**/build.ninja"])
     if bn:
-        return f'cd "{bn.parent}" && ninja'
+        bn.sort(key=lambda p: len(p.parts))
+        return f'ninja -C "{bn[0].parent}"'
     return "echo 'No Makefile/meson.build/build.ninja found' && exit 1"
 
+# ---------------- Node ----------------
+def probe_node():
+    pj = find_all(["package.json", "**/package.json"])
+    if not pj:
+        return "echo 'No package.json found' && exit 1"
+    # pick the one closest to root
+    pj.sort(key=lambda p: len(p.parts))
+    d = pj[0].parent
+    # resolve scripts:build?
+    txt = pj[0].read_text(errors="ignore")
+    has_build = re.search(r'"scripts"\s*:\s*{[^}]*"build"\s*:', txt) is not None
+    if has_build:
+        return f'cd "{d}" && npm ci && npm run build'
+    return f'cd "{d}" && npm ci && npm run build --if-present'
+
+# ---------------- Python ----------------
+def probe_python():
+    py = find_all(["pyproject.toml","setup.py","**/pyproject.toml","**/setup.py"])
+    if not py:
+        return "echo 'No python project found' && exit 1"
+    py.sort(key=lambda p: len(p.parts))
+    d = py[0].parent
+    return f'cd "{d}" && pip install -e . && (pytest || python -m pytest || true)'
+
 # ---------------- Other ecosystems ----------------
-def probe_node() -> str:
-    if (ROOT / "package.json").exists():
-        return "npm ci && npm run build --if-present"
-    p = find_first(["**/package.json"])
-    if p:
-        return f'cd "{p.parent}" && npm ci && npm run build --if-present'
-    return "echo 'No package.json found' && exit 1"
-
-def probe_python() -> str:
-    if (ROOT / "pyproject.toml").exists() or (ROOT / "setup.py").exists():
-        return "pip install -e . && (pytest || python -m pytest || true)"
-    p = find_first(["**/pyproject.toml", "**/setup.py"])
-    if p:
-        return f'cd "{p.parent}" && pip install -e . && (pytest || python -m pytest || true)'
-    return "echo 'No python project found' && exit 1"
-
-def probe_rust() -> str:
+def probe_rust():
+    # cargo finds workspace automatically
     return "cargo build --locked --all-targets --verbose"
 
-def probe_dotnet() -> str:
+def probe_dotnet():
     return "dotnet restore && dotnet build -c Release"
 
-def probe_maven() -> str:
+def probe_maven():
+    # mvn figures root by pom.xml in cwd, but we prefer top-most pom.xml
+    p = find_first(["pom.xml", "**/pom.xml"])
+    if p:
+        return f'cd "{p.parent}" && mvn -B package --file pom.xml'
     return "mvn -B package --file pom.xml"
 
-def probe_flutter() -> str:
+def probe_flutter():
+    p = find_first(["pubspec.yaml","**/pubspec.yaml"])
+    if p:
+        return f'cd "{p.parent}" && flutter build apk --debug'
     return "flutter build apk --debug"
 
-def probe_go() -> str:
+def probe_go():
+    p = find_first(["go.mod","**/go.mod"])
+    if p:
+        return f'cd "{p.parent}" && go build ./...'
     return "go build ./..."
 
+def probe_bazel():
+    # build all targets
+    return "bazel build //..."
+
+def probe_scons():
+    # parallel scons
+    return "scons -Q -j$(nproc)"
+
+def probe_ninja():
+    p = find_first(["build.ninja","**/build.ninja"])
+    if p:
+        return f'ninja -C "{p.parent}"'
+    return "ninja -C build"
+
+# ---------------- Main ----------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--type", required=True,
-                    choices=["android","cmake","linux","node","python","rust","dotnet","maven","flutter","go","unknown"])
+        choices=["android","cmake","linux","node","python","rust",
+                 "dotnet","maven","flutter","go","bazel","scons","ninja","unknown"])
     args = ap.parse_args()
 
     if args.type == "android": cmd = probe_android()
@@ -234,6 +286,9 @@ def main():
     elif args.type == "maven": cmd = probe_maven()
     elif args.type == "flutter": cmd = probe_flutter()
     elif args.type == "go": cmd = probe_go()
+    elif args.type == "bazel": cmd = probe_bazel()
+    elif args.type == "scons": cmd = probe_scons()
+    elif args.type == "ninja": cmd = probe_ninja()
     else: cmd = "echo 'No build system detected' && exit 1"
 
     print_output_var("BUILD_CMD", cmd)
