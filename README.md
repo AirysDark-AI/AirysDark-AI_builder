@@ -19,7 +19,7 @@ Targets supported: **Android, Linux, CMake, Node, Python, Rust, .NET, Maven, Flu
   </a>
 </p>
 
-> Replace `${OWNER}` and `${REPO}` above (or remove the badges).
+
 
 ---
 
