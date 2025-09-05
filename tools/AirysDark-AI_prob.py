@@ -204,7 +204,7 @@ def propose_build_cmd(target: str) -> str:
     else:                return "echo 'Unknown TARGET; update env.TARGET' && exit 1"
 
 
-# ---------------- EXTRA: Android deep probe (NEW) ----------------
+# ---------------- EXTRA: Android deep probe ----------------
 
 def _find_gradlews_all():
     gws = []
@@ -217,13 +217,11 @@ def _find_gradlews_all():
 
 def _parse_settings_modules(txt: str):
     mods = set()
-    # include(":app", ":lib")
     for m in re.findall(r'include\s*\((.*?)\)', txt, flags=re.S|re.I):
         for part in re.split(r'[,\s]+', m.strip()):
             part = part.strip().strip("'\"")
             if part.startswith(":"): part = part[1:]
             if part: mods.add(part)
-    # Kotlin DSL lines like: include(":app")
     for m in re.findall(r'include\s*\(?\s*[\'"](:?[^\'"]+)[\'"]\s*\)?', txt, flags=re.I):
         v = m.strip().strip("'\"")
         if v.startswith(":"): v = v[1:]
@@ -231,10 +229,6 @@ def _parse_settings_modules(txt: str):
     return sorted(mods)
 
 def android_deep_probe():
-    """
-    Best-effort module & task discovery without requiring Java to be installed.
-    If tasks can be listed, prefer tasks actually present; otherwise heuristics.
-    """
     info = {
         "wrappers": [],
         "modules": [],
@@ -245,7 +239,6 @@ def android_deep_probe():
     gws = _find_gradlews_all()
     info["wrappers"] = [str(x) for x in gws]
 
-    # read settings.gradle / settings.gradle.kts under the wrapper dir
     if gws:
         gw = gws[0]
         gdir = gw.parent
@@ -255,13 +248,10 @@ def android_deep_probe():
                 mods = _parse_settings_modules(sp.read_text(errors="ignore"))
                 info["modules"] = mods
                 break
-
-        # Try to read tasks table quickly (may fail if JDK missing — ignore)
         out, _ = _sh("./gradlew -q tasks --all", cwd=gdir, timeout=20)
         if out:
             info["tasks_sample"] = out[:20000]
 
-    # rank guesses
     guesses = []
     prefers = info["modules"] or ["app", "mobile", "android"]
     for m in prefers:
@@ -286,7 +276,7 @@ def android_deep_probe():
     return info
 
 
-# ---------------- Setup steps for generic build workflow (unchanged) ----------------
+# ---------------- Setup steps for generic build workflow ----------------
 
 def setup_steps_yaml(ptype: str) -> str:
     if ptype == "android":
@@ -350,7 +340,7 @@ def setup_steps_yaml(ptype: str) -> str:
     return ""
 
 
-# ---------------- Generic build workflow generation (your original path) ----------------
+# ---------------- Generic build workflow generation (patched) ----------------
 
 def render_build_workflow(target: str, build_cmd: str) -> str:
     setup = setup_steps_yaml(target)
@@ -364,6 +354,10 @@ on:
 permissions:
   contents: write
   pull-requests: write
+
+env:
+  # Optional central KB repo; leave blank to skip
+  KB_COLLECTION_REPO: "AirysDark-AI/ai-kb-collection"
 
 jobs:
   build:
@@ -381,6 +375,13 @@ jobs:
           python-version: "3.11"
 
 __SETUP__
+
+      # ===== AI KB: restore cache =====
+      - name: Restore AI KB cache
+        uses: actions/cache@v4
+        with:
+          path: tools/ai_kb
+          key: ai-kb-__PTYPE__-${{ github.repository }}-v1
 
       - name: Verify AirysDark-AI tools exist
         shell: bash
@@ -453,6 +454,60 @@ __SETUP__
           if-no-files-found: ignore
           retention-days: 7
 
+      # ===== AI KB: upload artifact & save cache =====
+      - name: Upload AI KB (artifact)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-kb
+          path: tools/ai_kb/**
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Save AI KB cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: tools/ai_kb
+          key: ai-kb-__PTYPE__-${{ github.repository }}-v1
+
+      # ===== AI KB: push snapshot to collection repo (optional) via KB_PUSH_TOKEN =====
+      - name: Push KB snapshot to central collection repo
+        if: always() && env.KB_COLLECTION_REPO != '' && secrets.KB_PUSH_TOKEN != ''
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if [ ! -s tools/ai_kb/knowledge.jsonl ]; then
+            echo "No knowledge.jsonl to push; skipping."
+            exit 0
+          fi
+          OWNER_REPO="${GITHUB_REPOSITORY}"
+          OWNER="${OWNER_REPO%%/*}"
+          REPO="${OWNER_REPO#*/}"
+          TS="$(date -u +'%Y-%m-%dT%H-%M-%SZ')"
+          WORKDIR="$(mktemp -d)"
+          git config --global user.name "airysdark-ai-bot"
+          git config --global user.email "airysdark-ai-bot@users.noreply.github.com"
+          git clone "https://x-access-token:${{ secrets.KB_PUSH_TOKEN }}@github.com/${{ env.KB_COLLECTION_REPO }}.git" "$WORKDIR/kb"
+          cd "$WORKDIR/kb"
+          mkdir -p "${OWNER}/${REPO}/snapshots"
+          cp -f "$GITHUB_WORKSPACE/tools/ai_kb/knowledge.jsonl" "${OWNER}/${REPO}/knowledge.jsonl"
+          cp -f "$GITHUB_WORKSPACE/tools/ai_kb/knowledge.jsonl" "${OWNER}/${REPO}/snapshots/${TS}.jsonl"
+          {
+            echo "repo: ${OWNER_REPO}"
+            echo "run_id: ${GITHUB_RUN_ID}"
+            echo "run_url: https://github.com/${OWNER_REPO}/actions/runs/${GITHUB_RUN_ID}"
+            echo "ref: ${GITHUB_REF}"
+            echo "timestamp: ${TS}"
+          } > "${OWNER}/${REPO}/snapshots/${TS}.meta"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No KB changes to push."
+            exit 0
+          fi
+          git commit -m "KB snapshot: ${OWNER_REPO} @ ${TS}"
+          git push origin HEAD:main
+
       - name: Check for changes
         id: diff
         shell: bash
@@ -495,12 +550,14 @@ __SETUP__
     return yml
 
 
-# ---------------- Android-only workflow generation (NEW) ----------------
+# ---------------- Android-only workflow generation (patched) ----------------
 
 def write_workflow_android():
     """
     Android workflow calls the self-contained runner (tools/AirysDark-AI_android.py)
     which handles probe/loop/fix internally. No extra fetching here.
+    Adds AI KB cache + optional KB push via KB_PUSH_TOKEN.
+    Also adds a conservative fallback 'builder.py' invocation if BUILD_CMD was exposed.
     """
     yml = r"""
 name: AirysDark-AI - Android (generated)
@@ -511,6 +568,13 @@ on:
 permissions:
   contents: write
   pull-requests: write
+
+env:
+  # Optional central KB repo; leave blank to skip
+  KB_COLLECTION_REPO: "AirysDark-AI/ai-kb-collection"
+  # on  = run AirysDark-AI_android.py (self-contained Android logic)
+  # off = skip android.py and use AirysDark-AI_builder.py instead
+  ANDROID_LOGIC: "on"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -539,12 +603,82 @@ jobs:
       - run: yes | sdkmanager --licenses
       - run: sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
 
+      # ===== AI KB: restore cache =====
+      - name: Restore AI KB cache
+        uses: actions/cache@v4
+        with:
+          path: tools/ai_kb
+          key: ai-kb-android-${{ github.repository }}-v1
+
       - name: Verify tools exist (no extra fetches here)
         run: |
           set -euxo pipefail
           test -f tools/AirysDark-AI_Request.py
           test -f tools/AirysDark-AI_android.py
+          test -f tools/AirysDark-AI_builder.py || true
           ls -la tools
+
+- name: Android strategy
+        run: echo "ANDROID_LOGIC=${{ env.ANDROID_LOGIC }}"
+
+      # ---------- ANDROID LOGIC: ON (uses AirysDark-AI_android.py) ----------
+      - name: Run Android AI loop
+        if: ${{ env.ANDROID_LOGIC == 'on' }}
+        id: android_run
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'gpt-4o-mini' }}
+          AI_BUILDER_ATTEMPTS: "3"
+          AI_LOG_TAIL: "160"
+        run: |
+          set -euxo pipefail
+          python3 tools/AirysDark-AI_android.py --mode run | tee /tmp/android.out
+          # (optional) forward any discovered command
+          if grep -q '^BUILD_CMD=' /tmp/android.out; then
+            CMD=$(grep -E '^BUILD_CMD=' /tmp/android.out | sed 's/^BUILD_CMD=//')
+            echo "BUILD_CMD=$CMD" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ---------- ANDROID LOGIC: OFF (uses AirysDark-AI_builder.py) ----------
+      - name: Determine Gradle build command
+        if: ${{ env.ANDROID_LOGIC == 'off' }}
+        id: plan
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CMD=""
+          if [ -x ./gradlew ]; then
+            CMD="./gradlew assembleDebug --stacktrace"
+          else
+            F=$(git ls-files '**/gradlew' | head -n1 || true)
+            if [ -n "$F" ]; then
+              cd "$(dirname "$F")"
+              CMD="./gradlew assembleDebug --stacktrace"
+            fi
+          fi
+          echo "BUILD_CMD=$CMD"
+          echo "BUILD_CMD=$CMD" >> "$GITHUB_OUTPUT"
+
+      - name: Build (capture)
+        if: ${{ env.ANDROID_LOGIC == 'off' }}
+        id: build
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CMD="${{ steps.plan.outputs.BUILD_CMD }}"
+          [ -n "$CMD" ] || { echo "No build command found"; exit 1; }
+          set +e; bash -lc "$CMD" | tee build.log; EXIT=$?; set -e
+          echo "EXIT_CODE=$EXIT" >> "$GITHUB_OUTPUT"
+          exit 0
+        continue-on-error: true
+
+      - name: Attempt AI auto-fix with builder.py
+        if: ${{ env.ANDROID_LOGIC == 'off' && steps.build.outputs.EXIT_CODE != '0' }}
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'gpt-4o-mini' }}
+          BUILD_CMD: ${{ steps.plan.outputs.BUILD_CMD }}
+        run: python3 tools/AirysDark-AI_builder.py || true
 
       - name: Run Android AI loop
         id: run
@@ -561,6 +695,19 @@ jobs:
             echo "BUILD_CMD=$CMD" >> "$GITHUB_OUTPUT"
           fi
 
+      # Opportunistic fallback: if BUILD_CMD is present and build.log indicates failure, try builder.py
+      - name: Attempt AI auto-fix via builder (fallback)
+        if: always() && steps.run.outputs.BUILD_CMD != ''
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'gpt-4o-mini' }}
+          BUILD_CMD: ${{ steps.run.outputs.BUILD_CMD }}
+        run: |
+          set -euxo pipefail
+          if [ -f build.log ]; then
+            python3 tools/AirysDark-AI_builder.py || true
+          fi
+
       - name: Upload logs & artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -574,6 +721,51 @@ jobs:
             tools/android_ai_response.txt
             tools/android_probe.json
             tools/android_probe.log
+            tools/ai_kb/**
+
+      # ===== AI KB: save cache and optional push to collection =====
+      - name: Save AI KB cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: tools/ai_kb
+          key: ai-kb-android-${{ github.repository }}-v1
+
+      - name: Push KB snapshot to central collection repo
+        if: always() && env.KB_COLLECTION_REPO != '' && secrets.KB_PUSH_TOKEN != ''
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if [ ! -s tools/ai_kb/knowledge.jsonl ]; then
+            echo "No knowledge.jsonl to push; skipping."
+            exit 0
+          fi
+          OWNER_REPO="${GITHUB_REPOSITORY}"
+          OWNER="${OWNER_REPO%%/*}"
+          REPO="${OWNER_REPO#*/}"
+          TS="$(date -u +'%Y-%m-%dT%H-%M-%SZ')"
+          WORKDIR="$(mktemp -d)"
+          git config --global user.name "airysdark-ai-bot"
+          git config --global user.email "airysdark-ai-bot@users.noreply.github.com"
+          git clone "https://x-access-token:${{ secrets.KB_PUSH_TOKEN }}@github.com/${{ env.KB_COLLECTION_REPO }}.git" "$WORKDIR/kb"
+          cd "$WORKDIR/kb"
+          mkdir -p "${OWNER}/${REPO}/snapshots"
+          cp -f "$GITHUB_WORKSPACE/tools/ai_kb/knowledge.jsonl" "${OWNER}/${REPO}/knowledge.jsonl"
+          cp -f "$GITHUB_WORKSPACE/tools/ai_kb/knowledge.jsonl" "${OWNER}/${REPO}/snapshots/${TS}.jsonl"
+          {
+            echo "repo: ${OWNER_REPO}"
+            echo "run_id: ${GITHUB_RUN_ID}"
+            echo "run_url: https://github.com/${OWNER_REPO}/actions/runs/${GITHUB_RUN_ID}"
+            echo "ref: ${GITHUB_REF}"
+            echo "timestamp: ${TS}"
+          } > "${OWNER}/${REPO}/snapshots/${TS}.meta"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No KB changes to push."
+            exit 0
+          fi
+          git commit -m "KB snapshot: ${OWNER_REPO} @ ${TS}"
+          git push origin HEAD:main
 
       - name: Stage changes
         id: diff
@@ -584,20 +776,6 @@ jobs:
           else:
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
-
-      - name: Pin remote with Fine-grained PAT
-        if: ${{ steps.diff.outputs.changed == 'true' }}
-        env:
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          REPO_SLUG: ${{ github.repository }}
-        run: |
-          set -euxo pipefail
-          git config --local --name-only --get-regexp '^http\.https://github\.com/\.extraheader$' >/dev/null 2>&1 && \
-            git config --local --unset-all http.https://github.com/.extraheader || true
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          git remote set-url origin "https://x-access-token:${BOT_TOKEN}@github.com/${REPO_SLUG}.git"
-          git config --global url."https://x-access-token:${BOT_TOKEN}@github.com/".insteadOf "https://github.com/"
-          git remote -v
 
       - name: Create PR with Android changes
         if: ${{ steps.diff.outputs.changed == 'true' }}
@@ -617,7 +795,7 @@ jobs:
     return str(ANDROID_WF)
 
 
-# ---------------- OpenAI (optional, unchanged) ----------------
+# ---------------- OpenAI (optional) ----------------
 
 def call_openai(prompt: str) -> str:
     import requests
@@ -641,7 +819,6 @@ def call_openai(prompt: str) -> str:
     if r.status_code >= 400:
         raise RuntimeError(f"openai_error {r.status_code}: {r.text[:400]}")
     out = r.json()["choices"][0]["message"]["content"].strip()
-    # strip code fences if present
     out = re.sub(r"^```[a-zA-Z]*\n", "", out)
     out = re.sub(r"\n```$", "", out)
     return out
@@ -688,11 +865,10 @@ def main():
     # 3) Propose a build command for TARGET
     build_cmd = propose_build_cmd(target)
 
-    # 3b) Android deep probe (extra data & better recommendation) — NEW
+    # 3b) Android deep probe (extra data & better recommendation)
     android_info = None
     if (target or "").lower() == "android":
         android_info = android_deep_probe()
-        # prefer the deep-probe recommendation
         if android_info.get("cmd_recommendation"):
             build_cmd = android_info["cmd_recommendation"]
 
@@ -706,7 +882,6 @@ def main():
     }
     PROB_JSON.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
-    # append-only log (NEW)
     with PROB_LOG.open("a", encoding="utf-8") as f:
         from datetime import datetime, timezone
         f.write(f"\n==== PROBE @ {datetime.now(timezone.utc).isoformat()} ====\n")
@@ -716,9 +891,8 @@ def main():
     generated_path = None
     if (target or "").lower() == "android":
         generated_path = write_workflow_android()
-        used_ai = False  # Android path uses the android runner, not AI-drafted YAML
+        used_ai = False
     else:
-        # AI-drafted generic build, else fallback template
         used_ai = False
         try:
             prompt = build_ai_prompt(report, target, build_cmd)
