@@ -1,210 +1,349 @@
 #!/usr/bin/env python3
+# AirysDark-AI_builder.py
+# Smart, safe build-fixer with diff-only contract, retries, rollback-on-worse,
+# OpenAI→llama fallback, redaction, and rich artifacts.
+
+import os, sys, re, json, pathlib, subprocess, tempfile, shlex, datetime
+
+ROOT = pathlib.Path(os.getenv("PROJECT_ROOT", ".")).resolve()
+ATTEMPTS = int(os.getenv("AI_BUILDER_ATTEMPTS", "3"))
+PROVIDER = os.getenv("PROVIDER", "openai")            # openai | llama
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+FALLBACK_PROVIDER = os.getenv("FALLBACK_PROVIDER", "llama")
+LLAMA_CPP_BIN = os.getenv("LLAMA_CPP_BIN", "llama-cli")
+LLAMA_MODEL_PATH = pathlib.Path(os.getenv("MODEL_PATH", "models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"))
+LLAMA_CTX = int(os.getenv("LLAMA_CTX", "4096"))
+
+# Prompt/context sizing
+MAX_PROMPT_TOKENS = int(os.getenv("MAX_PROMPT_TOKENS", "2500"))   # ~4 chars/token heuristic
+REPO_TREE_LIMIT   = int(os.getenv("MAX_FILES_IN_TREE", "80"))
+DIFF_CHAR_LIMIT   = int(os.getenv("RECENT_DIFF_MAX_CHARS", "2200"))
+LOG_TAIL_LINES    = int(os.getenv("AI_LOG_TAIL", "160"))
+
+# Build
+BUILD_CMD = os.getenv("BUILD_CMD", "./gradlew assembleDebug --stacktrace")
+
+# Edit constraints
+ALLOWLIST_GLOBS = [g for g in os.getenv("ALLOWLIST_GLOBS", "").split(",") if g.strip()]
+DENYLIST_GLOBS  = [g for g in os.getenv("DENYLIST_GLOBS", "").split(",") if g.strip()]
+
+# Files / artifacts
+BUILD_LOG = ROOT / "build.log"
+PATCH_SNAPSHOT = ROOT / ".pre_ai_fix.patch"
+AI_SUMMARY = ROOT / "ai_summary.txt"
+AI_ATTEMPTS_LOG = ROOT / ".ai_attempt.jsonl"
+
+DANGEROUS_PATH_HINTS = [
+    ".github/workflows/",  # CI definitions
+    ".git/",               # repo internals
+    "secrets.", "keystore", "gradle.properties", "local.properties",
+]
+
+PROMPT = """You are an automated build fixer working inside a Git repository.
+
+Goal:
+- Fix the current build failure with the smallest safe changes.
+
+Resources:
+- Truncated repo file list:
+{repo_tree}
+
+- Truncated recent VCS diff:
+{recent_diff}
+
+- Build command:
+{build_cmd}
+
+- Failing build log tail (last {log_tail} lines):
+{build_tail}
+
+Constraints:
+- Output ONLY a unified diff (GNU patch format) with file hunks starting with '---' and '+++' lines and '@@' sections.
+- Do NOT include explanations, code fences, or prose.
+- Keep edits minimal and localized to fix the error.
+- Prefer updating config (Gradle/CMake/etc.) or version bumps when appropriate.
+- Do NOT modify unrelated files.
+- If no change is needed, output an empty diff (just nothing).
+
+If editing build systems, keep them consistent (e.g., Gradle plugin & Kotlin versions).
 """
-AirysDark-AI_builder.py
-AI auto-fix script to be used by generated build workflows after a failed build.
 
-Design:
-- No external fetching or model setup here (the workflow does that).
-- Calls the centralized requester (AirysDark-AI_Request.py) to talk to OpenAI (fallback llama.cpp).
-- Reads existing build.log (or runs the build once if missing), asks the AI for a unified diff,
-  applies it to the working tree, and writes .pre_ai_fix.patch for inspection.
-- Does NOT commit: the workflow's PR step takes care of staging/committing/opening PRs.
+def run(cmd, cwd=ROOT, capture=False, check=False, env=None):
+    if capture:
+        p = subprocess.run(cmd, cwd=cwd, shell=True, text=True,
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
+        if check and p.returncode != 0:
+            raise subprocess.CalledProcessError(p.returncode, cmd, p.stdout)
+        return p
+    else:
+        return subprocess.run(cmd, cwd=cwd, shell=True, env=env, check=check)
 
-Env:
-  BUILD_CMD                    # the command that failed (string)
-  AI_BUILDER_ATTEMPTS=3        # how many attempts (ask AI again if needed)
-  MAX_PROMPT_TOKENS=2500       # passed through to requester via env (optional)
-  PROVIDER / FALLBACK_PROVIDER # 'openai' (primary) → 'llama' (fallback), etc.
-  OPENAI_API_KEY / OPENAI_MODEL / MODEL_PATH etc. handled by requester
-
-Outputs (files):
-  .pre_ai_fix.patch                 # the patch we applied
-  tools/airysdark_ai_builder_out.txt   # raw AI response (for debugging)
-"""
-
-import os
-import sys
-import subprocess
-import pathlib
-import tempfile
-import re
-from typing import Optional
-
-PROJECT_ROOT = pathlib.Path(os.getenv("PROJECT_ROOT", ".")).resolve()
-BUILD_CMD = os.getenv("BUILD_CMD", "").strip()
-MAX_ATTEMPTS = int(os.getenv("AI_BUILDER_ATTEMPTS", "3"))
-AI_LOG_TAIL = int(os.getenv("AI_LOG_TAIL", "120"))
-
-TOOLS_DIR = PROJECT_ROOT / "tools"
-TOOLS_DIR.mkdir(parents=True, exist_ok=True)
-
-AI_OUT_PATH = TOOLS_DIR / "airysdark_ai_builder_out.txt"
-BUILD_LOG = PROJECT_ROOT / "build.log"
-PATCH_SNAPSHOT = PROJECT_ROOT / ".pre_ai_fix.patch"
-
-# ------------- import requester (filename has hyphens, so use importlib) -------------
-def _load_requester():
-    import importlib.util
-    req_path = PROJECT_ROOT / "tools" / "AirysDark-AI_Request.py"
-    if not req_path.exists():
-        raise RuntimeError(f"Missing requester: {req_path} (detector/probe should fetch it)")
-    spec = importlib.util.spec_from_file_location("airysdark_ai_request", str(req_path))
-    mod = importlib.util.module_from_spec(spec)  # type: ignore
-    assert spec and spec.loader
-    spec.loader.exec_module(mod)  # type: ignore
-    return mod
-
-# ------------- helpers -------------
-def sh(cmd: str, cwd: Optional[pathlib.Path] = None, check: bool = False, capture: bool = True) -> str:
-    p = subprocess.run(cmd, cwd=str(cwd or PROJECT_ROOT), shell=True, text=True,
-                       stdout=subprocess.PIPE if capture else None,
-                       stderr=subprocess.STDOUT if capture else None)
-    if check and p.returncode != 0:
-        raise subprocess.CalledProcessError(p.returncode, cmd, output=(p.stdout or ""))
-    return p.stdout if capture else ""
+def git(*args, capture=False):
+    return run("git " + " ".join(shlex.quote(a) for a in args), capture=capture)
 
 def ensure_git_repo():
-    if not (PROJECT_ROOT / ".git").exists():
-        # minimal local repo so git apply works cleanly
-        sh('git init', check=False, capture=False)
-        sh('git config user.name "airysdark-ai"', check=False)
-        sh('git config user.email "airysdark-ai@local"', check=False)
-        sh('git add -A', check=False)
-        sh('git commit -m "bootstrap repo for ai builder" || true', check=False)
+    if not (ROOT / ".git").exists():
+        run('git init')
+        run('git config user.name "airysdark-ai"')
+        run('git config user.email "airysdark-ai@local"')
+        git("add", "-A")
+        run('git commit -m "AI: initial snapshot" || true')
 
-def repo_tree(max_files: int = 120) -> str:
-    out = sh("git ls-files || true")
-    files = [ln for ln in (out or "").splitlines() if ln.strip()]
-    return "\n".join(files[:max_files]) if files else "(no tracked files)"
+def repo_tree(limit=REPO_TREE_LIMIT):
+    out = run("git ls-files || true", capture=True).stdout.splitlines()
+    return "\n".join(out[:limit])
 
-def recent_diff(max_chars: int = 3000) -> str:
-    # last 5 commits diff; if none, empty
-    diff = sh("git diff --unified=2 -M -C HEAD~5..HEAD || true")
-    return diff[-max_chars:] if diff else "(no recent git diff)"
+def recent_diff(limit_chars=DIFF_CHAR_LIMIT):
+    out = run("git log --oneline -n 1 || true", capture=True).stdout.strip()
+    if not out:
+        return "(no recent commits)"
+    diff = run("git diff --unified=2 -M -C HEAD~5..HEAD || true", capture=True).stdout
+    return diff[-limit_chars:]
 
-def log_tail(lines: int = AI_LOG_TAIL) -> str:
+def log_tail(lines=LOG_TAIL_LINES):
     if not BUILD_LOG.exists():
         return "(no build log)"
-    data = BUILD_LOG.read_text(errors="ignore").splitlines()
-    if not data:
-        return "(empty build log)"
-    start = max(0, len(data) - int(lines))
-    return "\n".join(data[start:])
+    return "\n".join(BUILD_LOG.read_text(errors="ignore").splitlines()[-lines:])
 
-def run_build_once_if_missing_log():
-    if BUILD_LOG.exists() and BUILD_LOG.stat().st_size > 0:
-        return
-    if not BUILD_CMD:
-        return
-    # Run the build once just to capture output into build.log
+def redact(text: str) -> str:
+    # scrub obvious secret-like tokens
+    text = re.sub(r'(?:AKIA|ASIA|SK|GH|GHO|ghp_)\\w+', '***REDACTED***', text)
+    text = re.sub(r'(?i)(api[-_ ]?key|token|secret)\\s*[:=]\\s*\\S+', '\\1: ***REDACTED***', text)
+    return text
+
+def truncate_for_tokens(s: str, max_tokens=MAX_PROMPT_TOKENS):
+    char_limit = max_tokens * 4
+    if len(s) <= char_limit:
+        return s
+    head = s[: int(char_limit * 0.60)]
+    tail = s[- int(char_limit * 0.35):]
+    return head + "\n\n[...truncated...]\n\n" + tail
+
+def build_once():
     with open(BUILD_LOG, "wb") as f:
-        proc = subprocess.Popen(BUILD_CMD, cwd=str(PROJECT_ROOT), shell=True,
-                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        assert proc.stdout
-        for line in proc.stdout:
+        p = subprocess.Popen(BUILD_CMD, cwd=ROOT, shell=True,
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        for line in p.stdout:
             sys.stdout.buffer.write(line)
             f.write(line)
-        proc.wait()
+    return p.wait()
 
-def extract_unified_diff(text: str) -> Optional[str]:
-    # Strong matcher first (---/+++ with hunks)
-    m = re.search(r"(?ms)^--- [^\n]+\n\+\+\+ [^\n]+\n(?:@@.*\n.*)+", text)
-    if m:
-        return text[m.start():].strip()
-    # Weak matcher (first ---/+++ block)
-    m2 = re.search(r"(?ms)^--- [^\n]+\n\+\+\+ [^\n]+\n", text)
-    if m2:
-        return text[m2.start():].strip()
-    return None
+def extract_unified_diff(text):
+    # Accepts diff starting at first '--- ' line
+    m = re.search(r'(?ms)^---\\s', text)
+    return text[m.start():].strip() if m else None
 
-def apply_patch(diff_text: str) -> bool:
-    # snapshot the proposed diff
-    PATCH_SNAPSHOT.write_text(diff_text, encoding="utf-8")
-    # try apply
-    with tempfile.NamedTemporaryFile("w", delete=False, suffix=".patch") as tmp:
-        tmp.write(diff_text)
-        tmp_path = tmp.name
+def diff_touches_dangerous_paths(diff_text: str) -> bool:
+    lower = diff_text.lower()
+    for hint in DANGEROUS_PATH_HINTS:
+        if hint in lower:
+            # allow only if explicitly permitted by allowlist
+            if not ALLOWLIST_GLOBS:
+                return True
+    return False
+
+def path_allowed_by_globs(filepath: str) -> bool:
+    if ALLOWLIST_GLOBS:
+        import fnmatch
+        if not any(fnmatch.fnmatch(filepath, g.strip()) for g in ALLOWLIST_GLOBS):
+            return False
+    if DENYLIST_GLOBS:
+        import fnmatch
+        if any(fnmatch.fnmatch(filepath, g.strip()) for g in DENYLIST_GLOBS):
+            return False
+    return True
+
+def filter_diff_by_globs(diff_text: str) -> str:
+    # crude per-file filter: keep only file sections allowed by globs
+    chunks = re.split(r'(?m)(?=^---\\s)', diff_text)
+    kept = []
+    for ch in chunks:
+        if not ch.strip():
+            continue
+        # try to read the "+++" path
+        m = re.search(r'^\\+\\+\\+\\s+(?:b/)?(.+)$', ch, flags=re.M)
+        path = m.group(1).strip() if m else ""
+        if path and path_allowed_by_globs(path):
+            kept.append(ch)
+    return "".join(kept) if kept else ""
+
+def apply_patch(diff_text: str) -> tuple[bool, str]:
+    tmp = tempfile.NamedTemporaryFile("w", delete=False, suffix=".patch")
+    tmp.write(diff_text)
+    tmp.close()
     try:
-        sh(f"git add -A || true", check=False)
-        # keep whitespace flexible; reject files create .rej if needed
-        out = sh(f"git apply --reject --whitespace=fix {tmp_path} || true")
-        # If nothing actually changed, return False so workflow can skip PR
-        chg = sh("git status --porcelain")
-        return bool(chg.strip())
+        git("add", "-A")
+        run(f"git diff --staged > {shlex.quote(str(PATCH_SNAPSHOT))} || true")
+        # try normal apply
+        r = run(f"git apply --reject --whitespace=fix {shlex.quote(tmp.name)}", capture=True)
+        if r.returncode != 0:
+            # try 3-way
+            r2 = run(f"git apply --3way --reject --whitespace=fix {shlex.quote(tmp.name)}", capture=True)
+            if r2.returncode != 0:
+                return False, r2.stdout
+        git("add", "-A")
+        run('git commit -m "AI: apply automatic fix" || true')
+        return True, "applied"
     finally:
+        os.unlink(tmp.name)
+
+def compare_fail_signal(before_log: str, after_log: str) -> int:
+    """Lower is better (fewer obvious failures)."""
+    def score(t: str) -> int:
+        t = t.lower()
+        s = 0
+        for kw in ["failed", "error", "exception", "could not", "not found", "undefined", "unresolved"]:
+            s += t.count(kw)
+        return s
+    return score(after_log) - score(before_log)
+
+# ---------------- LLM providers ----------------
+
+def _call_openai(prompt):
+    key = os.environ.get("OPENAI_API_KEY")
+    if not key:
+        raise RuntimeError("openai_error: missing OPENAI_API_KEY")
+    import requests
+    url = "https://api.openai.com/v1/chat/completions"
+    payload = {
+        "model": OPENAI_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.2,
+    }
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    r = requests.post(url, headers=headers, json=payload, timeout=180)
+    if r.status_code >= 400:
         try:
-            os.unlink(tmp_path)
+            err = r.json()
         except Exception:
-            pass
+            err = {"raw": r.text}
+        raise RuntimeError("openai_error:" + json.dumps(err))
+    data = r.json()
+    return data["choices"][0]["message"]["content"]
 
-# ------------- main -------------
-def main() -> int:
-    print("== AirysDark-AI builder (unified diff fixer) ==")
-    print("Project:", PROJECT_ROOT)
-
-    ensure_git_repo()
-    run_build_once_if_missing_log()
-
-    # Prepare context for the AI
-    tree = repo_tree()
-    diff = recent_diff()
-    tail = log_tail(AI_LOG_TAIL)
-
-    # Load requester dynamically
-    req = _load_requester()
-
-    task = (
-        "You are an automated build fixer working in a Git repository.\n"
-        "Goal: return ONLY a unified diff (---/+++ with @@ hunks) that minimally fixes the build error.\n"
-        "Keep edits small and safe; update build config (Gradle/CMake/etc.) only if needed. "
-        "Do not change unrelated files."
-    )
-    context_parts = [
-        "## Repository file list (truncated)\n" + tree,
-        "## Recent git diff (truncated)\n" + diff,
-        f"## Build command\n{BUILD_CMD or '(unknown)'}",
-        f"## Build log tail (last {AI_LOG_TAIL} lines)\n{tail}",
+def _call_llama(prompt):
+    if not LLAMA_MODEL_PATH.exists():
+        raise RuntimeError(f"llama_error: model missing at {LLAMA_MODEL_PATH}")
+    safe = truncate_for_tokens(prompt, MAX_PROMPT_TOKENS)
+    cmd = [
+        LLAMA_CPP_BIN,
+        "-m", str(LLAMA_MODEL_PATH),
+        "-p", safe,
+        "-n", "2048",
+        "--temp", "0.2",
+        "-c", str(LLAMA_CTX),
     ]
+    out = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if out.returncode != 0:
+        raise RuntimeError("llama_error:" + out.stdout[:500])
+    return out.stdout
 
-    attempts = max(1, MAX_ATTEMPTS)
-    for i in range(1, attempts + 1):
-        print(f"\n-- AI attempt {i}/{attempts} --")
+def call_llm(prompt):
+    if PROVIDER == "openai":
         try:
-            out_text, maybe_diff = req.request_ai(
-                task,
-                context_parts=context_parts,
-                want_diff=True,
-                system="You are a precise CI fixer. Output only a unified diff when asked for code changes."
-            )
-        except Exception as e:
-            print(f"AI request failed: {e}")
-            continue
+            return _call_openai(prompt)
+        except RuntimeError as e:
+            if "openai_error" in str(e) and FALLBACK_PROVIDER == "llama":
+                print("⚠️ OpenAI failed. Falling back to llama.cpp…")
+                return _call_llama(prompt)
+            raise
+    elif PROVIDER == "llama":
+        return _call_llama(prompt)
+    else:
+        raise RuntimeError(f"Unknown PROVIDER={PROVIDER}")
 
-        # Save raw AI output for debugging
-        try:
-            AI_OUT_PATH.write_text(out_text, encoding="utf-8")
-        except Exception:
-            pass
+# ---------------- Main loop ----------------
 
-        # Be robust: if the requester didn't parse diff, try ourselves
-        diff_text = maybe_diff or extract_unified_diff(out_text or "")
-        if not diff_text:
-            print("AI did not return a recognizable unified diff; retrying...")
-            continue
+def main():
+    ensure_git_repo()
 
-        print("Applying patch...")
-        changed = apply_patch(diff_text)
-        if not changed:
-            print("Patch applied but no changes detected (maybe already applied or empty).")
-            continue
-
-        print("✅ Patch applied and working tree changed.")
-        print(f"   Saved snapshot: {PATCH_SNAPSHOT}")
+    # 0) Baseline build (if build.log already exists we still refresh it)
+    print(f"== AirysDark-AI builder ==\nProject: {ROOT}\nProvider: {PROVIDER} (fallback: {FALLBACK_PROVIDER})")
+    print(f"Build command: {BUILD_CMD}")
+    base_code = build_once()
+    if base_code == 0:
+        print("✅ Build already succeeds. Nothing to do.")
         return 0
 
-    print("❌ No usable patch after attempts.")
-    return 1
+    before_log_tail = log_tail()
 
+    for attempt in range(1, ATTEMPTS + 1):
+        print(f"\n== Attempt {attempt}/{ATTEMPTS} ==")
+
+        # 1) Compose prompt
+        ctx = PROMPT.format(
+            repo_tree=redact(truncate_for_tokens(repo_tree())),
+            recent_diff=redact(truncate_for_tokens(recent_diff())),
+            build_cmd=BUILD_CMD,
+            log_tail=LOG_TAIL_LINES,
+            build_tail=redact(truncate_for_tokens(log_tail())),
+        )
+        ctx = truncate_for_tokens(ctx)
+
+        # 2) Ask model
+        try:
+            raw = call_llm(ctx)
+        except Exception as e:
+            print("LLM call failed:", e)
+            return 1
+
+        diff = extract_unified_diff(raw or "")
+        if not diff:
+            print("LLM did not return a unified diff. Stopping.")
+            return 1
+
+        if diff_touches_dangerous_paths(diff):
+            print("⚠️ Proposed diff touches restricted paths; rejecting.")
+            return 1
+
+        if ALLOWLIST_GLOBS or DENYLIST_GLOBS:
+            filtered = filter_diff_by_globs(diff)
+            if not filtered.strip():
+                print("⚠️ Diff removed by globs; nothing to apply.")
+                return 1
+            diff = filtered
+
+        # 3) Apply patch
+        ok, why = apply_patch(diff)
+        # Log attempt
+        with open(AI_ATTEMPTS_LOG, "a", encoding="utf-8") as jf:
+            jf.write(json.dumps({
+                "ts": datetime.datetime.utcnow().isoformat() + "Z",
+                "attempt": attempt,
+                "apply_ok": ok,
+                "apply_note": why,
+                "diff_preview": diff[:1200],
+            }) + "\n")
+
+        if not ok:
+            print("Patch apply failed.")
+            return 1
+
+        # 4) Rebuild
+        code = build_once()
+        after_tail = log_tail()
+
+        # 5) Compare signal
+        delta = compare_fail_signal(before_log_tail, after_tail)
+        if code == 0:
+            print("✅ Build fixed!")
+            with open(AI_SUMMARY, "w", encoding="utf-8") as f:
+                f.write("Build fixed on attempt %d\n" % attempt)
+            return 0
+        else:
+            # If the new log is "worse", rollback
+            if delta > 0:
+                print("⚠️ Build seems worse; rolling back last commit.")
+                git("reset", "--hard", "HEAD~1")
+                # restore previous build log snapshot if we want, but we keep latest for debugging
+            else:
+                # keep the change; it might be partial progress
+                pass
+
+        before_log_tail = after_tail
+
+    print("❌ Still failing after attempts.")
+    return 1
 
 if __name__ == "__main__":
     sys.exit(main())
