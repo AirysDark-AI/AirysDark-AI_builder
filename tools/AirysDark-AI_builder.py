@@ -1,50 +1,27 @@
 #!/usr/bin/env python3
-# AirysDark-AI_builder.py (OpenAI -> llama.cpp fallback)
-#
-# Env:
-#   PROVIDER=openai|llama      (default openai)
-#   OPENAI_API_KEY=...         (needed if PROVIDER=openai)
-#   OPENAI_MODEL=gpt-4o-mini   (override with repo/Actions vars)
-#   FALLBACK_PROVIDER=llama
-#   MODEL_PATH=models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
-#   LLAMA_CPP_BIN=llama-cli
-#   LLAMA_CTX=4096
-#   MAX_PROMPT_TOKENS=2500     (~4 chars/token crude)
-#   AI_LOG_TAIL=120
-#   MAX_FILES_IN_TREE=120
-#   RECENT_DIFF_MAX_CHARS=6000
-#   AI_BUILDER_ATTEMPTS=3
-#   BUILD_CMD=...              (must be supplied by the workflow)
-#   PROJECT_ROOT="."
-#
-# Output:
-#   - build.log (captured)
-#   - .pre_ai_fix.patch (staged diff before AI patch)
-#   - commits changes with message "airysdark-ai: apply automatic fix"
-
 import os, sys, subprocess, json, tempfile, re, pathlib, requests
 
 # -------- Config (env-overridable) --------
-PROVIDER = os.getenv("PROVIDER", "openai")
+PROVIDER = os.getenv("PROVIDER", "openai")              # "openai" or "llama"
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 FALLBACK_PROVIDER = os.getenv("FALLBACK_PROVIDER", "llama")
 LLAMA_CPP_BIN = os.getenv("LLAMA_CPP_BIN", "llama-cli")
 LLAMA_MODEL_PATH = os.getenv("MODEL_PATH", "models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf")
 
-LLAMA_CTX = int(os.getenv("LLAMA_CTX", "4096"))
-MAX_PROMPT_TOKENS = int(os.getenv("MAX_PROMPT_TOKENS", "2500"))
-AI_LOG_TAIL = int(os.getenv("AI_LOG_TAIL", "120"))
-MAX_FILES_IN_TREE = int(os.getenv("MAX_FILES_IN_TREE", "120"))
-RECENT_DIFF_MAX_CHARS = int(os.getenv("RECENT_DIFF_MAX_CHARS", "6000"))
+# Prompt / context controls
+LLAMA_CTX = int(os.getenv("LLAMA_CTX", "4096"))                 # llama context tokens
+MAX_PROMPT_TOKENS = int(os.getenv("MAX_PROMPT_TOKENS", "2500")) # headroom below 4k
+AI_LOG_TAIL = int(os.getenv("AI_LOG_TAIL", "80"))              # log lines to include
+MAX_FILES_IN_TREE = int(os.getenv("MAX_FILES_IN_TREE", "60"))
+RECENT_DIFF_MAX_CHARS = int(os.getenv("RECENT_DIFF_MAX_CHARS", "2000"))
 
 MAX_ATTEMPTS = int(os.getenv("AI_BUILDER_ATTEMPTS", "3"))
-BUILD_CMD = os.getenv("BUILD_CMD", "echo 'No BUILD_CMD set' && exit 1")
+BUILD_CMD = os.getenv("BUILD_CMD", "./gradlew assembleDebug --stacktrace")
 PROJECT_ROOT = pathlib.Path(os.getenv("PROJECT_ROOT", ".")).resolve()
 
-PROMPT = """You are an automated build fixer operating on a Git repository.
-
-GOAL: Fix build/test failures with the smallest, safest changes.
+PROMPT = """You are an automated build fixer. You are working in a Git repository.
+Goal: Fix build/test failures by editing files minimally.
 
 Repository file list (truncated):
 {repo_tree}
@@ -60,12 +37,12 @@ Build log tail (last {ai_log_tail} lines):
 
 Constraints:
 - Return ONLY a valid unified diff starting with ---/+++ and @@ hunks.
-- Keep edits minimal, precise, and safe.
-- If build config changes are needed (Gradle/CMake/Workflow/etc.), include them in the diff.
-- Prefer updating APIs or versions only if that’s the root cause.
+- Keep edits minimal and safe.
+- If build config changes are needed (e.g., Gradle/CMake), include them in the diff.
+- Prefer updating deprecated APIs or SDK versions if that's the cause.
 - Do NOT modify unrelated files.
 
-Now output ONLY the unified diff to fix the error.
+Now output the unified diff to fix the error.
 """
 
 # -------- helpers --------
@@ -85,12 +62,10 @@ def get_repo_tree(max_files=MAX_FILES_IN_TREE):
     return "\n".join(files[:max_files])
 
 def get_recent_diff(max_chars=RECENT_DIFF_MAX_CHARS):
-    tip = run("git log --oneline -n 1 || true", capture=True).stdout.strip()
-    if not tip:
+    out = run("git log --oneline -n 1 || true", capture=True)
+    if out.stdout.strip() == "":
         return "(no recent commits)"
     diff = run("git diff --unified=2 -M -C HEAD~5..HEAD || true", capture=True).stdout
-    if not diff:
-        return "(no changes in last 5 commits)"
     return diff[-max_chars:]
 
 def tail_build_log(lines=None):
@@ -103,6 +78,7 @@ def tail_build_log(lines=None):
     return "\n".join(data[-int(lines):])
 
 def truncate_prompt(p: str, max_tokens=MAX_PROMPT_TOKENS):
+    # crude approximation: 1 token ≈ 4 chars
     char_limit = max_tokens * 4
     if len(p) <= char_limit:
         return p
@@ -200,7 +176,7 @@ def apply_patch(diff_text):
         run("git diff --staged > .pre_ai_fix.patch || true")
         run(f"git apply --reject --whitespace=fix {tmp.name}", capture=True)
         git("add", "-A")
-        run('git commit -m "airysdark-ai: apply automatic fix" || true')
+        run('git commit -m "ai-autobuilder: apply automatic fix" || true')
         return True
     except Exception as e:
         print("Patch apply failed:", e)
@@ -210,16 +186,15 @@ def apply_patch(diff_text):
 
 # -------- main --------
 def main():
-    print("== AirysDark-AI Builder (OpenAI → llama fallback) ==")
+    print("== AI Autobuilder (OpenAI → llama fallback) ==")
     print("Project:", PROJECT_ROOT)
     print(f"Provider: {PROVIDER}, Model: {OPENAI_MODEL}, Fallback: {FALLBACK_PROVIDER}")
-
     if not (PROJECT_ROOT / ".git").exists():
         run("git init")
-        run('git config user.name "airysdark-ai"')
-        run('git config user.email "airysdark-ai@local"')
+        run('git config user.name "ai-autobuilder"')
+        run('git config user.email "ai-autobuilder@local"')
         git("add", "-A")
-        run('git commit -m "airysdark-ai: initial snapshot" || true')
+        run('git commit -m "ai-autobuilder: initial snapshot" || true')
 
     code = run_build()
     if code == 0:

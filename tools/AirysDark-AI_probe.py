@@ -31,7 +31,7 @@ def find_all(globs):
     out = []
     for g in globs:
         out.extend(ROOT.glob(g))
-    # de-dup but keep order
+    # de-dup keep order
     seen, dedup = set(), []
     for p in out:
         if p not in seen:
@@ -45,7 +45,7 @@ def find_first(globs):
     return None
 
 def count_sources(dir_path: Path):
-    exts = (".c", ".cc", ".cpp", ".cxx", ".h", ".hpp")
+    exts = (".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".kt", ".java")
     n = 0
     for p in dir_path.rglob("*"):
         if p.suffix.lower() in exts:
@@ -54,26 +54,15 @@ def count_sources(dir_path: Path):
 
 # ---------------- Android (Gradle) ----------------
 def parse_settings_modules(settings_path: Path):
-    """
-    Parse settings.gradle(.kts) and extract included modules like ':app', ':feature:home'.
-    """
     if not settings_path or not settings_path.exists():
         return []
     txt = settings_path.read_text(errors="ignore")
-    # Groovy/KTS variants:
-    # include(':app', ':lib'); include(":feature:home")
-    # include ':app', ':lib'
     mods = []
-
-    # include(...) style
     for raw in re.findall(r'include\s*\((.*?)\)', txt, flags=re.S):
         for part in re.split(r'[, \n\t]+', raw.strip()):
             part = part.strip().strip('"\'')
             if part.startswith(":"):
                 mods.append(part[1:])
-
-    # include ':a', ':b' style (no parentheses)
-    # capture lines like: include ':app', ':lib'
     for line in txt.splitlines():
         m = re.match(r'\s*include\s+(.+)', line)
         if m:
@@ -82,8 +71,6 @@ def parse_settings_modules(settings_path: Path):
                 part = part.strip().strip('"\'')
                 if part.startswith(":"):
                     mods.append(part[1:])
-
-    # unique keep-order
     seen, order = set(), []
     for m in mods:
         if m and m not in seen:
@@ -92,7 +79,6 @@ def parse_settings_modules(settings_path: Path):
     return order
 
 def module_is_android_app(root_dir: Path, module_name: str) -> bool:
-    # translate module like "app" or "feature:home" -> path "feature/home"
     mod_path = root_dir / module_name.replace(":", "/")
     for fname in ("build.gradle", "build.gradle.kts"):
         f = mod_path / fname
@@ -103,7 +89,6 @@ def module_is_android_app(root_dir: Path, module_name: str) -> bool:
     return False
 
 def pick_best_gradlew():
-    # prefer root gradlew, else the one whose dir has settings + app module
     candidates = []
     for g in find_all(["gradlew", "**/gradlew"]):
         d = g.parent
@@ -116,11 +101,8 @@ def pick_best_gradlew():
         modules = parse_settings_modules(settings) if settings else []
         has_app = any(module_is_android_app(d, m) for m in modules)
         candidates.append((g, settings is not None, has_app, modules))
-
     if not candidates:
         return None, None, []
-
-    # sort: settings present & has_app first, root-most path next (shortest parts)
     candidates.sort(key=lambda x: (not x[1], not x[2], len(x[0].parts)))
     g, _, _, modules = candidates[0]
     try:
@@ -132,23 +114,18 @@ def pick_best_gradlew():
 def probe_android():
     g, gdir, modules = pick_best_gradlew()
     if not g:
-        # no wrapper found, generic attempt
         return "./gradlew assembleDebug --stacktrace"
-
-    # query tasks
     out, _ = sh(f"./{g.name} -q tasks --all", cwd=gdir)
+
     def task_exists(t):
         return re.search(rf"(^|\s){re.escape(t)}(\s|$)", out) is not None
 
-    # ranked tasks (plain then module-specific)
     base_tasks = ["assembleDebug", "bundleDebug", "assembleRelease", "bundleRelease", "build"]
     module_tasks = []
-    # prefer real app modules from settings
     for m in modules:
         if module_is_android_app(gdir, m):
             for t in ("assembleDebug","bundleDebug","assembleRelease","bundleRelease"):
                 module_tasks.append(f":{m}:{t}")
-    # common guesses
     for guess in ("app","mobile","android"):
         for t in ("assembleDebug","bundleDebug","assembleRelease","bundleRelease"):
             module_tasks.append(f":{guess}:{t}")
@@ -159,7 +136,6 @@ def probe_android():
     for t in module_tasks:
         if task_exists(t):
             return f'cd {shlex.quote(str(gdir))} && ./gradlew {t} --stacktrace'
-    # final fallback
     return f'cd {shlex.quote(str(gdir))} && ./gradlew assembleDebug --stacktrace'
 
 # ---------------- CMake ----------------
@@ -169,8 +145,7 @@ def score_cmakelists(cmake_file: Path):
     for kw in ("project(", "add_executable(", "find_package(", "add_library("):
         if kw in txt:
             score += 2
-    score += min(50, count_sources(cmake_file.parent))  # proximity to sources helps
-    # slightly prefer top-level (short path)
+    score += min(50, count_sources(cmake_file.parent))
     score += max(0, 10 - len(cmake_file.parts))
     return score
 
@@ -178,7 +153,6 @@ def probe_cmake():
     cmakes = find_all(["CMakeLists.txt", "**/CMakeLists.txt"])
     if not cmakes:
         return "echo 'No CMakeLists.txt found' && exit 1"
-    # choose best scoring one
     best = max(cmakes, key=score_cmakelists)
     d = best.parent
     outdir = f'build/{str(d.relative_to(ROOT)).replace("/", "_")}'
@@ -188,12 +162,10 @@ def probe_cmake():
 def probe_linux():
     mk = find_all(["Makefile", "**/Makefile"])
     if mk:
-        # pick the Makefile closest to repo root (shortest path)
         mk.sort(key=lambda p: len(p.parts))
         return f'make -C "{mk[0].parent}" -j'
     mb = find_all(["meson.build", "**/meson.build"])
     if mb:
-        # pick meson closest to root
         mb.sort(key=lambda p: len(p.parts))
         d = mb[0].parent
         return f'(cd "{d}" && (meson setup build --wipe || true); meson setup build || true; ninja -C build)'
@@ -208,10 +180,8 @@ def probe_node():
     pj = find_all(["package.json", "**/package.json"])
     if not pj:
         return "echo 'No package.json found' && exit 1"
-    # pick the one closest to root
     pj.sort(key=lambda p: len(p.parts))
     d = pj[0].parent
-    # resolve scripts:build?
     txt = pj[0].read_text(errors="ignore")
     has_build = re.search(r'"scripts"\s*:\s*{[^}]*"build"\s*:', txt) is not None
     if has_build:
@@ -227,16 +197,14 @@ def probe_python():
     d = py[0].parent
     return f'cd "{d}" && pip install -e . && (pytest || python -m pytest || true)'
 
-# ---------------- Other ecosystems ----------------
+# ---------------- Others ----------------
 def probe_rust():
-    # cargo finds workspace automatically
     return "cargo build --locked --all-targets --verbose"
 
 def probe_dotnet():
     return "dotnet restore && dotnet build -c Release"
 
 def probe_maven():
-    # mvn figures root by pom.xml in cwd, but we prefer top-most pom.xml
     p = find_first(["pom.xml", "**/pom.xml"])
     if p:
         return f'cd "{p.parent}" && mvn -B package --file pom.xml'
@@ -255,11 +223,9 @@ def probe_go():
     return "go build ./..."
 
 def probe_bazel():
-    # build all targets
     return "bazel build //..."
 
 def probe_scons():
-    # parallel scons
     return "scons -Q -j$(nproc)"
 
 def probe_ninja():

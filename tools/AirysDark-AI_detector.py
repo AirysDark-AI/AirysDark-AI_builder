@@ -1,25 +1,23 @@
 #!/usr/bin/env python3
-# AirysDark-AI_detector.py  — full production generator
+# AirysDark-AI_detector.py — FG-PAT ready, fixes if: expressions, deep detection
 #
-# Detects build systems across the entire repo (recursive),
-# then writes one PROBE workflow per type:
+# Detects build systems across the entire repo and writes one PROBE workflow per type:
 #   .github/workflows/AirysDark-AI_prob_<type>.yml
 #
 # Each PROBE workflow:
 #   - fetches AirysDark-AI tools (detector, probe, builder)
-#   - runs the probe to compute a solid BUILD_CMD
-#   - writes the final build workflow: .github/workflows/AirysDark-AI_<type>.yml
-#   - creates a PR for that final workflow (uses BOT_TOKEN)
+#   - runs AirysDark-AI_probe.py to compute BUILD_CMD
+#   - writes final workflow .github/workflows/AirysDark-AI_<type>.yml
+#   - opens a PR for the final workflow using BOT_TOKEN (Fine-grained PAT)
 #
-# Final workflow features:
-#   - per-ecosystem setup (Android/Node/Rust/Dotnet/Maven/Flutter/Go/Linux)
-#   - Build (capture) with artifacts
-#   - llama.cpp build (no CURL) + TinyLlama GGUF fetch
+# Final workflow:
+#   - per-ecosystem setup
+#   - Build (capture) + artifacts
+#   - llama.cpp build in runner temp + TinyLlama fetch
 #   - AI auto-fix (OpenAI → llama fallback)
-#   - PR with patch if changes (uses BOT_TOKEN)
+#   - PR with AI changes using BOT_TOKEN
 #
-# Safe placeholder: we use __GHA__ ... __GHA_END__ and convert to ${{ ... }} only at the end,
-# to avoid GitHub "secret in repo" push protection.
+# NOTE: This script writes YAML with proper GitHub expressions (no placeholder braces issues).
 
 import os
 import pathlib
@@ -30,7 +28,7 @@ ROOT = pathlib.Path(os.getenv("PROJECT_DIR", ".")).resolve()
 WF = ROOT / ".github" / "workflows"
 WF.mkdir(parents=True, exist_ok=True)
 
-# ---------- Helpers ----------
+# ---------- Full-repo scan ----------
 def scan_all_files():
     files = []
     for root, dirs, filenames in os.walk(ROOT):
@@ -58,9 +56,6 @@ def collect_dir_name_hints(files):
             names.add(part.lower())
     return names
 
-def _gha_finalize_placeholders(s: str) -> str:
-    return s.replace("__GHA__", "${{").replace("__GHA_END__", "}}")
-
 # ---------- CMake classifier ----------
 ANDROID_HINTS = (
     "android", "android_abi", "android_platform", "ndk",
@@ -81,7 +76,7 @@ def cmakelists_flavor(cm_txt: str) -> str:
         return "desktop"
     return "desktop"
 
-# ---------- Detection ----------
+# ---------- Detect project types ----------
 def detect_types():
     files = scan_all_files()
     fnames = [n for n, _ in files]
@@ -98,7 +93,7 @@ def detect_types():
     if "windows" in dir_hints and "windows" not in types:
         types.append("windows")
 
-    # Android
+    # Android / Gradle
     if ("gradlew" in fnames) or any("build.gradle" in n or "settings.gradle" in n for n in fnames):
         if "android" not in types:
             types.append("android")
@@ -113,12 +108,12 @@ def detect_types():
             if cmakelists_flavor(txt) == "desktop" and "linux" not in types:
                 types.append("linux")
 
-    # Linux umbrella
-    if ("makefile" in fnames) or ("meson.build" in fnames) or any(r.endswith(".mk") for r in rels):
+    # Linux (Make / Meson / *.mk / build.ninja)
+    if ("makefile" in fnames) or ("meson.build" in fnames) or any(r.endswith(".mk") for r in rels) or ("build.ninja" in fnames):
         if "linux" not in types:
             types.append("linux")
 
-    # Other ecosystems
+    # Others
     if "package.json" in fnames and "node" not in types:
         types.append("node")
     if ("pyproject.toml" in fnames or "setup.py" in fnames) and "python" not in types:
@@ -152,7 +147,7 @@ def detect_types():
             out.append(t)
     return out
 
-# ---------- Setup steps ----------
+# ---------- Per-ecosystem setup ----------
 def setup_steps_inline(ptype: str) -> str:
     if ptype == "android":
         return textwrap.dedent("""
@@ -213,14 +208,14 @@ def setup_steps_inline(ptype: str) -> str:
         """)
     return ""
 
-# ---------- Writers ----------
+# ---------- Write PROBE workflow for non-Android ----------
 def write_probe_workflow_for_type(ptype: str):
     if ptype == "android":
         return write_probe_workflow_for_android()
 
     setup_inline = setup_steps_inline(ptype)
 
-    tmpl = r"""
+    tmpl = """
 name: AirysDark-AI - Probe __PTYPE_CAP__
 
 on:
@@ -232,6 +227,10 @@ on:
 permissions:
   contents: write
   pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   probe:
@@ -270,7 +269,7 @@ __SETUP_INLINE__
       - name: Generate final workflow .github/workflows/AirysDark-AI___PTYPE__.yml
         shell: bash
         env:
-          BUILD_CMD: "__GHA__ steps.probe.outputs.BUILD_CMD __GHA_END__"
+          BUILD_CMD: "${{ steps.probe.outputs.BUILD_CMD }}"
         run: |
           set -euo pipefail
           mkdir -p .github/workflows
@@ -282,6 +281,10 @@ __SETUP_INLINE__
             push:
               branches: ["**"]
             pull_request: {}
+
+          concurrency:
+            group: ${{ github.workflow }}-${{ github.ref }}
+            cancel-in-progress: true
 
           jobs:
             build:
@@ -333,10 +336,10 @@ __SETUP_INLINE__
 
                 # --- AI auto-fix (OpenAI -> llama.cpp) ---
                 - name: Build llama.cpp (CMake, no CURL, in temp)
-                  if: always() && __GHA__ steps.build.outputs.EXIT_CODE __GHA_END__ != '0'
+                  if: ${{ always() && steps.build.outputs.EXIT_CODE != '0' }}
                   run: |
                     set -euxo pipefail
-                    TMP="__GHA__ runner.temp __GHA_END__"
+                    TMP="${{ runner.temp }}"
                     cd "$TMP"
                     rm -rf llama.cpp
                     git clone --depth=1 https://github.com/ggml-org/llama.cpp
@@ -346,22 +349,22 @@ __SETUP_INLINE__
                     echo "LLAMA_CPP_BIN=$PWD/build/bin/llama-cli" >> $GITHUB_ENV
 
                 - name: Fetch GGUF model (TinyLlama)
-                  if: always() && __GHA__ steps.build.outputs.EXIT_CODE __GHA_END__ != '0'
+                  if: ${{ always() && steps.build.outputs.EXIT_CODE != '0' }}
                   run: |
                     mkdir -p models
                     curl -L -o models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
                       https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
 
                 - name: Attempt AI auto-fix (OpenAI -> llama fallback)
-                  if: always() && __GHA__ steps.build.outputs.EXIT_CODE __GHA_END__ != '0'
+                  if: ${{ always() && steps.build.outputs.EXIT_CODE != '0' }}
                   env:
                     PROVIDER: openai
                     FALLBACK_PROVIDER: llama
-                    OPENAI_API_KEY: __GHA__ secrets.OPENAI_API_KEY __GHA_END__
-                    OPENAI_MODEL: __GHA__ vars.OPENAI_MODEL || 'gpt-4o-mini' __GHA_END__
+                    OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+                    OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'gpt-4o-mini' }}
                     MODEL_PATH: models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
                     AI_BUILDER_ATTEMPTS: "3"
-                    BUILD_CMD: __GHA__ steps.build.outputs.BUILD_CMD __GHA_END__
+                    BUILD_CMD: ${{ steps.build.outputs.BUILD_CMD }}
                   run: python3 tools/AirysDark-AI_builder.py || true
 
                 - name: Upload AI patch (if any)
@@ -384,10 +387,10 @@ __SETUP_INLINE__
                     fi
 
                 - name: Pin git remote with token (just-in-time)
-                  if: __GHA__ steps.diff.outputs.changed __GHA_END__ == 'true'
+                  if: ${{ steps.diff.outputs.changed == 'true' }}
                   env:
-                    BOT_TOKEN: __GHA__ secrets.BOT_TOKEN __GHA_END__
-                    REPO_SLUG: __GHA__ github.repository __GHA_END__
+                    BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+                    REPO_SLUG: ${{ github.repository }}
                   run: |
                     set -euxo pipefail
                     git config --local --name-only --get-regexp '^http\.https://github\.com/\.extraheader$' >/dev/null 2>&1 && \
@@ -398,16 +401,16 @@ __SETUP_INLINE__
                     git remote -v
 
                 - name: Create PR with AI fixes
-                  if: __GHA__ steps.diff.outputs.changed __GHA_END__ == 'true'
+                  if: ${{ steps.diff.outputs.changed == 'true' }}
                   uses: peter-evans/create-pull-request@v6
                   with:
-                    token: __GHA__ secrets.BOT_TOKEN __GHA_END__
+                    token: ${{ secrets.BOT_TOKEN }}
                     branch: ai/airysdark-ai-autofix-__PTYPE__
                     commit-message: "chore: AirysDark-AI auto-fix (__PTYPE__)"
                     title: "AirysDark-AI: automated build fix (__PTYPE__)"
                     body: |
                       This PR was opened automatically by a generated workflow after a failed build.
-                      - Build command: __GHA__ steps.build.outputs.BUILD_CMD __GHA_END__
+                      - Build command: ${{ steps.build.outputs.BUILD_CMD }}
                       - Captured the failing build log
                       - Proposed a minimal fix via AI
                       - Committed the changes for review
@@ -416,8 +419,8 @@ __SETUP_INLINE__
 
       - name: Pin git remote with token (just-in-time)
         env:
-          BOT_TOKEN: __GHA__ secrets.BOT_TOKEN __GHA_END__
-          REPO_SLUG: __GHA__ github.repository __GHA_END__
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          REPO_SLUG: ${{ github.repository }}
         run: |
           set -euxo pipefail
           git config --local --name-only --get-regexp '^http\.https://github\.com/\.extraheader$' >/dev/null 2>&1 && \
@@ -430,13 +433,13 @@ __SETUP_INLINE__
       - name: Create PR with generated final workflow
         uses: peter-evans/create-pull-request@v6
         with:
-          token: __GHA__ secrets.BOT_TOKEN __GHA_END__
+          token: ${{ secrets.BOT_TOKEN }}
           branch: ai/airysdark-ai-workflow-__PTYPE__
           commit-message: "chore: add AirysDark-AI___PTYPE__ workflow (probed)"
           title: "AirysDark-AI: add __PTYPE__ workflow (from probe)"
           body: |
             This PR adds the final __PTYPE__ AI build workflow, generated by the probe run.
-            - Probed command: __GHA__ steps.probe.outputs.BUILD_CMD __GHA_END__
+            - Probed command: ${{ steps.probe.outputs.BUILD_CMD }}
             - Next: merge this PR, then run "AirysDark-AI - __PTYPE_CAP__ (generated)"
           labels: automation, ci
 """.lstrip("\n")
@@ -449,15 +452,15 @@ __SETUP_INLINE__
             .replace("__SETUP_INLINE__", setup_block.rstrip("\n"))
             .replace("__PTYPE__", ptype)
             .replace("__PTYPE_CAP__", ptype.capitalize()))
-    yaml = _gha_finalize_placeholders(yaml)
 
     (WF / f"AirysDark-AI_prob_{ptype}.yml").write_text(yaml)
     print(f"✅ Generated: AirysDark-AI_prob_{ptype}.yml")
 
+# ---------- Android has a dedicated template ----------
 def write_probe_workflow_for_android():
     setup_inline = setup_steps_inline("android")
 
-    tmpl = r"""
+    tmpl = """
 name: AirysDark-AI - Probe Android
 
 on:
@@ -469,6 +472,10 @@ on:
 permissions:
   contents: write
   pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   probe:
@@ -507,7 +514,7 @@ __SETUP_INLINE__
       - name: Generate final workflow .github/workflows/AirysDark-AI_android.yml
         shell: bash
         env:
-          BUILD_CMD: "__GHA__ steps.probe.outputs.BUILD_CMD __GHA_END__"
+          BUILD_CMD: "${{ steps.probe.outputs.BUILD_CMD }}"
         run: |
           set -euo pipefail
           mkdir -p .github/workflows
@@ -519,6 +526,10 @@ __SETUP_INLINE__
             push:
               branches: ["**"]
             pull_request: {}
+
+          concurrency:
+            group: ${{ github.workflow }}-${{ github.ref }}
+            cancel-in-progress: true
 
           jobs:
             build:
@@ -579,10 +590,10 @@ __SETUP_INLINE__
 
                 # --- AI auto-fix (OpenAI -> llama.cpp) ---
                 - name: Build llama.cpp (CMake, no CURL, in temp)
-                  if: always() && __GHA__ steps.build.outputs.EXIT_CODE __GHA_END__ != '0'
+                  if: ${{ always() && steps.build.outputs.EXIT_CODE != '0' }}
                   run: |
                     set -euxo pipefail
-                    TMP="__GHA__ runner.temp __GHA_END__"
+                    TMP="${{ runner.temp }}"
                     cd "$TMP"
                     rm -rf llama.cpp
                     git clone --depth=1 https://github.com/ggml-org/llama.cpp
@@ -592,22 +603,22 @@ __SETUP_INLINE__
                     echo "LLAMA_CPP_BIN=$PWD/build/bin/llama-cli" >> $GITHUB_ENV
 
                 - name: Fetch GGUF model (TinyLlama)
-                  if: always() && __GHA__ steps.build.outputs.EXIT_CODE __GHA_END__ != '0'
+                  if: ${{ always() && steps.build.outputs.EXIT_CODE != '0' }}
                   run: |
                     mkdir -p models
                     curl -L -o models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
                       https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
 
                 - name: Attempt AI auto-fix (OpenAI -> llama fallback)
-                  if: always() && __GHA__ steps.build.outputs.EXIT_CODE __GHA_END__ != '0'
+                  if: ${{ always() && steps.build.outputs.EXIT_CODE != '0' }}
                   env:
                     PROVIDER: openai
                     FALLBACK_PROVIDER: llama
-                    OPENAI_API_KEY: __GHA__ secrets.OPENAI_API_KEY __GHA_END__
-                    OPENAI_MODEL: __GHA__ vars.OPENAI_MODEL || 'gpt-4o-mini' __GHA_END__
+                    OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+                    OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'gpt-4o-mini' }}
                     MODEL_PATH: models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
                     AI_BUILDER_ATTEMPTS: "3"
-                    BUILD_CMD: __GHA__ steps.build.outputs.BUILD_CMD __GHA_END__
+                    BUILD_CMD: ${{ steps.build.outputs.BUILD_CMD }}
                   run: python3 tools/AirysDark-AI_builder.py || true
 
                 - name: Upload AI patch (if any)
@@ -630,10 +641,10 @@ __SETUP_INLINE__
                     fi
 
                 - name: Pin git remote with token (just-in-time)
-                  if: __GHA__ steps.diff.outputs.changed __GHA_END__ == 'true'
+                  if: ${{ steps.diff.outputs.changed == 'true' }}
                   env:
-                    BOT_TOKEN: __GHA__ secrets.BOT_TOKEN __GHA_END__
-                    REPO_SLUG: __GHA__ github.repository __GHA_END__
+                    BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+                    REPO_SLUG: ${{ github.repository }}
                   run: |
                     set -euxo pipefail
                     git config --local --name-only --get-regexp '^http\.https://github\.com/\.extraheader$' >/dev/null 2>&1 && \
@@ -644,16 +655,16 @@ __SETUP_INLINE__
                     git remote -v
 
                 - name: Create PR with AI fixes
-                  if: __GHA__ steps.diff.outputs.changed __GHA_END__ == 'true'
+                  if: ${{ steps.diff.outputs.changed == 'true' }}
                   uses: peter-evans/create-pull-request@v6
                   with:
-                    token: __GHA__ secrets.BOT_TOKEN __GHA_END__
+                    token: ${{ secrets.BOT_TOKEN }}
                     branch: ai/airysdark-ai-autofix-android
                     commit-message: "chore: AirysDark-AI auto-fix (android)"
                     title: "AirysDark-AI: automated build fix (android)"
                     body: |
                       This PR was opened automatically by a generated workflow after a failed build.
-                      - Build command: __GHA__ steps.build.outputs.BUILD_CMD __GHA_END__
+                      - Build command: ${{ steps.build.outputs.BUILD_CMD }}
                       - Captured the failing build log
                       - Proposed a minimal fix via AI
                       - Committed the changes for review
@@ -662,8 +673,8 @@ __SETUP_INLINE__
 
       - name: Pin git remote with token (just-in-time)
         env:
-          BOT_TOKEN: __GHA__ secrets.BOT_TOKEN __GHA_END__
-          REPO_SLUG: __GHA__ github.repository __GHA_END__
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          REPO_SLUG: ${{ github.repository }}
         run: |
           set -euxo pipefail
           git config --local --name-only --get-regexp '^http\.https://github\.com/\.extraheader$' >/dev/null 2>&1 && \
@@ -676,13 +687,13 @@ __SETUP_INLINE__
       - name: Create PR with generated final workflow
         uses: peter-evans/create-pull-request@v6
         with:
-          token: __GHA__ secrets.BOT_TOKEN __GHA_END__
+          token: ${{ secrets.BOT_TOKEN }}
           branch: ai/airysdark-ai-workflow-android
           commit-message: "chore: add AirysDark-AI_android workflow (probed)"
           title: "AirysDark-AI: add Android workflow (from probe)"
           body: |
             This PR adds the final Android AI build workflow, generated by the probe run.
-            - Probed command: __GHA__ steps.probe.outputs.BUILD_CMD __GHA_END__
+            - Probed command: ${{ steps.probe.outputs.BUILD_CMD }}
             - Next: merge this PR, then run "AirysDark-AI - Android (generated)"
           labels: automation, ci
 """.lstrip("\n")
@@ -691,8 +702,7 @@ __SETUP_INLINE__
     if setup_inline.strip():
         setup_block = textwrap.indent(setup_inline.rstrip() + "\n", " " * 6)
 
-    yaml = (tmpl.replace("__SETUP_INLINE__", setup_block.rstrip("\n")))
-    yaml = _gha_finalize_placeholders(yaml)
+    yaml = tmpl.replace("__SETUP_INLINE__", setup_block.rstrip("\n"))
 
     (WF / "AirysDark-AI_prob_android.yml").write_text(yaml)
     print("✅ Generated: AirysDark-AI_prob_android.yml")
